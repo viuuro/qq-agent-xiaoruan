@@ -20,7 +20,45 @@ export const MARKET_API_BASE = 'https://www.kondius.cn/api/community';
 const ACCOUNT_FILE = path.join(DATA_DIR, 'account.json');
 const FETCH_TIMEOUT_MS = 30000;
 // 安装包下载上限与后端 MAX_UPLOAD 对齐
-const MAX_ZIP_BYTES = 8 * 1024 * 1024;
+export const MAX_ZIP_BYTES = 8 * 1024 * 1024;
+export const MAX_ERROR_RESPONSE_BYTES = 64 * 1024;
+
+/** 以流式方式读取有限大小的响应体，超限时立即取消下载。 */
+export async function readLimitedResponseBody(response, maxBytes = MAX_ZIP_BYTES) {
+  const limit = Number(maxBytes);
+  if (!Number.isSafeInteger(limit) || limit < 0) throw new Error('下载大小上限无效');
+  const lengthHeader = response.headers?.get?.('content-length');
+  const declaredLength = lengthHeader === null || lengthHeader === undefined || lengthHeader === ''
+    ? NaN
+    : Number(lengthHeader);
+  if (Number.isFinite(declaredLength) && declaredLength > limit) {
+    try { await response.body?.cancel?.(); } catch { /* 超限错误优先 */ }
+    throw new Error('安装包超过 8MB 上限');
+  }
+
+  if (typeof response.body?.getReader !== 'function') {
+    throw new Error('下载响应不支持流式读取');
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = Buffer.from(value);
+      total += chunk.length;
+      if (total > limit) {
+        try { await reader.cancel(); } catch { /* 超限错误优先 */ }
+        throw new Error('安装包超过 8MB 上限');
+      }
+      chunks.push(chunk);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks, total);
+}
 
 const log = (fn, ...args) => logger[fn]('market', ...args);
 
@@ -296,15 +334,19 @@ export async function installByCode({ code, verified }) {
     signal: AbortSignal.timeout(120000)
   });
   if (!res.ok) {
-    const text = await res.text().catch(() => '');
+    let text;
+    try {
+      text = (await readLimitedResponseBody(res, MAX_ERROR_RESPONSE_BYTES)).toString('utf8');
+    } catch {
+      // 错误页也可能是无限或超大响应体；reader 超限时已取消流，这里只给固定失败信息。
+      throw new Error(`下载失败：${friendlyMarketError(res)}`);
+    }
     // HTML 错误页 = nginx/网关层拦截（应用层错误是 JSON）；给出可排查的提示
     const why = /<\/?[a-z][^>]*>/i.test(text) ? friendlyMarketError(res) : (text.slice(0, 120) || `HTTP ${res.status}`);
     throw new Error(`下载失败：${why}`);
   }
-  const zipBuffer = Buffer.from(await res.arrayBuffer());
-  if (zipBuffer.length > MAX_ZIP_BYTES) throw new Error('安装包超过 8MB 上限');
-  const { unzipToModuleDir, validateZipStructure } = await import('./zip-install.js');
-  validateZipStructure(zipBuffer);
+  const zipBuffer = await readLimitedResponseBody(res);
+  const { unzipToModuleDir } = await import('./zip-install.js');
   const dirName = await unzipToModuleDir(zipBuffer, { root: ROOT, type, preferId: ident });
   log('info', `口令 ${code} 安装完成：${type}s/${dirName}`);
   return { ok: true, kind: type, id: dirName, dir: path.join(ROOT, type === 'plugin' ? 'plugins' : 'skills', dirName) };

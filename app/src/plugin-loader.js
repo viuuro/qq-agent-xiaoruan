@@ -27,7 +27,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { format } from 'node:util';
 import { pathToFileURL, fileURLToPath } from 'node:url';
-import { registerTool, unregisterTool, unregisterToolsBySkill, getTool, listTools } from './tool-registry.js';
+import {
+  registerTool, unregisterTool, unregisterToolsBySkill, getTool, listTools,
+  validateToolDefinition, replaceToolsBySkill
+} from './tool-registry.js';
 import { skillManager } from './skills/manager.js';
 import { normalizeManifest, isManifestUsable, SKILL_API_VERSION, kindOfDir } from './skills/manifest.js';
 import { skillErrorText } from './skills/errors.js';
@@ -68,7 +71,7 @@ function adaptLegacyPrompt(raw, manifest) {
  * 构造暴露给 Skill 的安全 API。
  * 与旧插件 API 的差别：多了 config / hook 注册 / 能力查询，但仍然只给白名单能力。
  */
-function createSkillApi(skillId, permissions = []) {
+function createSkillApi(skillId, permissions = [], registerDefinition = registerTool) {
   const has = (name) => permissions.includes(name);
   return {
     // 注册工具（自动加 skillId 前缀 + 绑定来源，便于开关联动与批量清理）
@@ -88,7 +91,7 @@ function createSkillApi(skillId, permissions = []) {
       if (existing && existing.skillId && existing.skillId !== skillId) {
         console.warn(`[skill] ⚠️ 工具 id 冲突：${prefixedId} 已由 ${existing.skillId} 注册，${skillId} 的同名工具会覆盖它`);
       }
-      registerTool({ ...def, id: prefixedId, skillId, _plugin: skillId });
+      registerDefinition({ ...def, id: prefixedId, skillId, _plugin: skillId });
       return prefixedId;
     },
     // 读取本 Skill 的配置（默认值已由 manifest.settings 合并）
@@ -329,52 +332,29 @@ async function loadSkillDir(dir, { log = console.log, kind = null } = {}) {
   }
 
   const permissions = Array.isArray(found.raw.permissions) ? found.raw.permissions : [];
-  const api = createSkillApi(manifest.id, permissions);
-
-  // ── 新旧交替的顺序闸（2026-09 修订版）────────────────────────────────────
-  // 目标有两个，且互相牵制：
-  //   A. 新 setup 抛错 → 旧实例必须完好保留（stale-but-working 优于 down）；
-  //   B. 新 setup 成功 → 新工具不能被旧实例的清理误删。
-  //
-  // 解法：把旧实例的退役拆成两段，夹住新 setup：
-  //   第一段（setup 前）：只做"停副作用"——deactivate（停定时器/监听）。
-  //     工具和能力**先不清**：万一 setup 抛错要走"保留旧实例"分支，清了就没了。
-  //   第二段（setup 成功后）：清旧能力、从 registry 摘掉旧实例（不走
-  //     unregister——它会 dispose + unregisterToolsBySkill(同 id)，把新工具
-  //     一起删掉），最后 register 新实例。旧工具里"新版本没再注册"的孤儿 id
-  //     由 loadPlugins 末尾的孤儿清扫兜底。
-  //   · setup 抛错：deactivate 过了要补一个 activate 把旧实例救活，
-  //     工具/能力/注册表全程未动，旧实例恢复原状继续跑。
-  //   · setup 成功：新实例接管，无幽灵。
   const prevSkill = skillManager.registry.get(manifest.id);
-  const prevWasLive = prevSkill && !prevSkill.loadError;
-  if (prevWasLive) {
-    try {
-      if (typeof prevSkill.deactivate === 'function') prevSkill.deactivate({ reason: 'reload' });
-    } catch (error) { log(`[skill] ⚠️ ${manifest.id} 旧实例 deactivate 失败：${error?.message ?? error}`); }
-  }
-
+  const stagedTools = new Map();
   const toolIds = [];
-  const collectingRegister = (def) => {
-    const id = api.registerTool(def);
-    toolIds.push(id);
+  let staging = true;
+  const registerDefinition = (def) => {
+    if (staging) {
+      const normalized = validateToolDefinition(def);
+      stagedTools.set(normalized.id, normalized);
+      return normalized.id;
+    }
+    const id = registerTool(def);
+    if (!toolIds.includes(id)) toolIds.push(id);
     return id;
   };
-  const apiWithCollect = { ...api, registerTool: collectingRegister };
+  const api = createSkillApi(manifest.id, permissions, registerDefinition);
 
-  // 跑新 setup。此时旧实例只停了副作用（deactivate），工具/能力/注册表未动 ——
-  // 抛错就走下面的"救活旧实例"分支。
+  // setup 只向临时注册表写工具定义。旧 Skill 在新 setup 成功前保持运行；
+  // setup 抛错时直接丢弃暂存定义，不动旧工具、能力、注册表或生命周期。
   try {
-    if (setupFn) await setupFn(apiWithCollect);
+    if (setupFn) await setupFn(api);
   } catch (error) {
-    // 注册失败：把已注册的工具回滚，避免"半个 Skill"残留在工具列表里
-    if (toolIds.length) unregisterToolsBySkill(manifest.id);
     const msg = `注册失败：${error.message}`;
     if (hadPrevious) {
-      // 救活旧实例：deactivate 过了要补 activate（对话记忆这类 Skill 的
-      // 后台定时器就靠它恢复）。工具/能力/注册表全程未动，恢复原状。
-      try { if (typeof prevSkill.activate === 'function') prevSkill.activate({ reason: 'reload-failed' }); }
-      catch (e2) { log(`[skill] ⚠️ ${manifest.id} 旧实例激活失败：${e2?.message ?? e2}`); }
       skillManager.errors.set(manifest.id, `${msg}（已沿用旧版本继续运行）`);
       log(`[skill] ❌ ${manifest.id}：${msg} —— 已保留旧版本继续运行`);
       return { dir, loaded: false, id: manifest.id, error: `${msg}（保留旧版本）` };
@@ -384,19 +364,12 @@ async function loadSkillDir(dir, { log = console.log, kind = null } = {}) {
     return r;
   }
 
-  // setup 成功：完成旧实例退役的第二段。
-  // ⚠️ 不能走 skillManager.unregister —— 它会 dispose（内部 unregisterToolsBySkill
-  // 同 id）把**新注册的工具**一起删掉。这里手动收尾：
-  //   · 清旧能力（新 setup 注册的能力马上会在 register() 里重新登记）
-  //   · 从 registry 摘掉旧实例，让下面 register() 看不到 prev、不会触发其内置
-  //     的 dispose 路径。
-  // 旧工具不在这里清：新 setup 用 registerTool 覆盖了同 id 定义，旧版本独有
-  // （新版本没注册）的旧 id 由"loader 级孤儿清扫"兜底（见 loadPlugins 末尾）。
-  if (prevSkill) {
-    skillManager.capabilities.removeOwner(manifest.id);
-    skillManager.registry.unregister(manifest.id);
-    skillManager.errors.delete(manifest.id);
-  }
+  // setup 全部成功后再退役旧实例。unregister 会停用并清理旧资源；随后工具
+  // 注册表一次性替换为暂存定义，旧版本独有的工具也会在本次替换中移除。
+  staging = false;
+  if (prevSkill) skillManager.unregister(manifest.id, { reason: 'reload' });
+  const stagedDefinitions = [...stagedTools.values()];
+  toolIds.push(...replaceToolsBySkill(manifest.id, stagedDefinitions));
 
   // 旧 plugin.json 的 tools[] 是**说明性元数据**（加载器不消费，工具靠入口 registerTool 注册）。
   // 声明了却没注册说明作者写漏了 —— 明确告警，别让它静默变成一个不存在的工具。
@@ -423,7 +396,7 @@ async function loadSkillDir(dir, { log = console.log, kind = null } = {}) {
     relDir: path.relative(APP_ROOT, dir).replace(/\\/g, '/'),
     // 目录语义类型：'plugin'（确定性型）/ 'skill'（LLM 型）/ null（自定义根，不判定）
     kind,
-    api: apiWithCollect,
+    api,
     toolIds,
     // 生命周期与扩展点（可选）
     available: typeof mod.available === 'function' ? mod.available : null,
@@ -526,6 +499,27 @@ export async function loadPlugins({ log = console.log, roots = null } = {}) {
 }
 
 /**
+ * Activate only the instances successfully installed by this scan.
+ * Failed reloads can leave a previous instance in the registry; activating the
+ * whole registry after a scan would call its activate hook a second time.
+ */
+export function activateLoadedPlugins(result, { manager = skillManager, log = console.log } = {}) {
+  const activated = [];
+  for (const item of result?.loaded || []) {
+    const id = String(item?.id || item?.skill?.manifest?.id || '');
+    if (!id || !item?.skill || manager.registry.get(id) !== item.skill) continue;
+    if (!manager.isLoaded(id) || !manager.isEnabled(id)) continue;
+    try {
+      manager.activate(id);
+      activated.push(id);
+    } catch (error) {
+      log(`[skill] 激活 ${id} 失败：${error?.message ?? error}`);
+    }
+  }
+  return activated;
+}
+
+/**
  * 监听目录变化（热重载）。
  * 重载策略：只重载"变化的那个 Skill"不可靠（Node 的 fs.watch 只给文件名、不给语义），
  * 因此整体重新扫描；但**不会**清空工具注册表 —— 逐个 Skill 注册时会覆盖同 id，
@@ -540,24 +534,34 @@ export function watchPlugins({ log = console.log, onReload, roots: rootsOpt = nu
   let reloadTimer = null;
   let reloading = false;      // 重入保护：一次 reload 超 500ms 时，防抖计时器可能再触发第二次
   let pendingAgain = false;   // reload 期间又来了变化 → 结束后再补一轮
+  let closed = false;
+  let reloadPromise = null;
   const watchers = [];
-  const runReload = async (filename) => {
-    if (reloading) { pendingAgain = true; return; }
+  const runReload = (filename) => {
+    if (closed) return Promise.resolve();
+    if (reloading) { pendingAgain = true; return Promise.resolve(); }
     reloading = true;
-    try {
-      log(`[skill] 检测到变化：${filename || ''}，重新扫描…`);
-      const result = await loadPlugins({ log, roots: { skills: skillsRoot, plugins: pluginsRoot } });
-      if (typeof onReload === 'function') onReload(result);
-    } catch (error) {
-      log(`[skill] 热重载失败：${error?.message ?? error}`);
-    } finally {
-      reloading = false;
-      if (pendingAgain) { pendingAgain = false; scheduleReload('(补一轮)'); }
-    }
+    reloadPromise = (async () => {
+      try {
+        log(`[skill] 检测到变化：${filename || ''}，重新扫描…`);
+        const result = await loadPlugins({ log, roots: { skills: skillsRoot, plugins: pluginsRoot } });
+        if (!closed && typeof onReload === 'function') await onReload(result);
+      } catch (error) {
+        log(`[skill] 热重载失败：${error?.message ?? error}`);
+      } finally {
+        reloading = false;
+        if (!closed && pendingAgain) { pendingAgain = false; scheduleReload('(补一轮)'); }
+      }
+    })();
+    return reloadPromise;
   };
   const scheduleReload = (filename) => {
+    if (closed) return;
     if (reloadTimer) clearTimeout(reloadTimer);
-    reloadTimer = setTimeout(() => { runReload(filename).catch(() => {}); }, 500);
+    reloadTimer = setTimeout(() => {
+      reloadTimer = null;
+      runReload(filename).catch(() => {});
+    }, 500);
   };
 
   for (const root of roots) {
@@ -568,7 +572,19 @@ export function watchPlugins({ log = console.log, onReload, roots: rootsOpt = nu
     }
   }
   log(`[skill] 热重载已启用（监听 ${roots.map((r) => path.basename(r)).join(' + ')}）`);
-  return { close: () => { for (const w of watchers) { try { w.close(); } catch { /* ignore */ } } } };
+  return {
+    close: async () => {
+      if (!closed) {
+        closed = true;
+        if (reloadTimer) clearTimeout(reloadTimer);
+        reloadTimer = null;
+        pendingAgain = false;
+        for (const w of watchers) { try { w.close(); } catch { /* ignore */ } }
+        watchers.length = 0;
+      }
+      if (reloadPromise) await reloadPromise;
+    }
+  };
 }
 
 /** 卸载一个 Skill（含工具回收）。 */

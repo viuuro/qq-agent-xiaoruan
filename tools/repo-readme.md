@@ -245,52 +245,43 @@ grep -q 'plugins:/app/plugins' deploy/docker-compose.yml && echo "挂载正常" 
 
 ---
 
-## 两种部署形态（别混用）
+## 两种部署形态
 
-仓库提供的是**形态 A**；如果你后来接入了 `qqdeploy`，服务器会变成**形态 B**。
-两者都合法，但**同一个服务器上只能选一种**，混用会出现"容器名已被占用"或
-"用了旧 compose 覆盖成陈旧代码"这类问题。
-
-| | 形态 A：仓库自带 compose | 形态 B：qqdeploy 管理（本项目线上） |
+| | 形态 A：仓库 Compose | 形态 B：qqdeploy |
 |---|---|---|
-| 适用 | 全新部署、单机试跑 | 需要多人协作、频繁迭代 |
-| qq-agent 代码来自 | `app/`（仓库工作副本） | `/opt/qq/releases/<sha>/`（每次部署独立目录） |
-| 更新方式 | `git pull` + `build --no-cache` + `up -d` | `sudo qqdeploy <分支>` |
-| 版本可追溯 | 靠 git 历史 | 靠 `.deployed.json` + `releases/` |
-| 回滚 | 手工 `git checkout` + 重建 | `sudo qqdeploy --rollback`（切软链，秒级定位） |
-| napcat 管理 | 同一个 compose 文件里 | 独立 `docker-compose.napcat.yml` |
+| 应用代码 | Git 工作副本的 `app/` | `/opt/qq/releases/<sha>/` |
+| 应用数据 | Compose 文件旁的 `data/`、`plugins/` | 经核对的独立数据及插件挂载 |
+| 更新方式 | 拉取代码、构建并重建 | `sudo qqdeploy <分支或SHA>` |
+| 版本记录 | Git 历史及管理员备份 | `.deployed.json`、操作记录及历史镜像 |
 
-### 从 A 迁到 B
+### 迁移前先核对线上实际状态
 
-用 `tools/retire-legacy-compose.sh`（服务器上以 root 执行，幂等）。它做四件事：
+`tools/retire-legacy-compose.sh` **只负责已完成 qqdeploy 接管后的入口退役**，不会搬运运行数据，也不会停容器。它会核对当前部署状态及实际挂载；未满足接管条件时拒绝退役。
 
-1. 生成 **`docker-compose.napcat.yml`** —— 只管理 napcat 的独立入口，
-   逐项对齐当前运行中的容器（镜像 / `shm_size: 256m` / 三个回环端口 / 两处挂载）
-2. 把旧的 `docker-compose.yml` 与 `docker-compose.platform.yml` 改名为 `*.legacy`，
-   并在文件头写入退役说明
-3. **全程不重启任何容器** —— 迁移本身对线上零影响
-4. 自检：确认旧命令已失效（会报 `compose file is invalid`，而不是静默用旧代码）、
-   新入口可解析、机器人仍健康
-
-> ⚠️ 迁到形态 B 后，**旧 compose 命令必须失效**。否则有人顺手跑
-> `docker compose -f /opt/qq/docker-compose.yml up -d`，会用旧源码覆盖线上，
-> 而且**没有明显报错** —— 本项目就踩过这个坑（源码目录与仓库不同步时，
-> 那条命令会把线上退回旧版本）。
-
-### 形态 B 里 napcat 的日常操作
+管理员先只读检查：
 
 ```bash
-docker restart napcat                    # ✅ 最简单，只影响 napcat
-
-cd /opt/qq                               # 或走 compose（改配置后）
-docker compose --env-file .env -f docker-compose.napcat.yml up -d
-docker compose --env-file .env -f docker-compose.napcat.yml logs -f
-
-# ❌ 绝对不要：
-# docker compose -f docker-compose.napcat.yml down
-#   它与 qq-agent 共用 compose 项目名（历史容器都属于该项目），
-#   down 会把整个项目的容器一起删除，qq-agent 也会消失。
+docker inspect qq-agent --format '{{json .Mounts}}'
+docker inspect napcat --format '{{json .Mounts}}'
+readlink -f /opt/qq/current
 ```
+
+不要根据空目录或仓库示例判断线上数据在哪里。从 A 迁移到 B 时，应先完成：
+
+1. 记录实际 Compose 项目、网络、挂载源路径和 UID/GID；备份应用源码、配置、插件与 NapCat 状态。
+2. 安排维护窗口，暂停应用写入，用保留属性的复制方式迁移确需调整的目录；校验内容、权限，保留源目录。NapCat 登录态不能落到空目录。
+3. 安装管理员审核的部署工具，准备可回退的基线版本与镜像，确认 B 使用的是已有数据。
+4. 完成一次部署和健康检查后，才执行退役脚本。若服务器已经是 B，跳过数据搬运。
+
+```bash
+sudo bash tools/retire-legacy-compose.sh
+```
+
+脚本先生成临时 Compose 并校验，再用唯一备份名保存旧文件；失败时恢复已修改的入口。NapCat 的网络、挂载与运行身份以现有容器为准。迁移期间不执行 `down` 或删除旧数据目录。
+
+### 形态 B 的日常操作
+
+协作者通过受控入口查看日志、重启 NapCat；管理员保留底层 Compose 运维权限。具体命令见 [协作者部署说明](tools/README-部署.md)。不要再用旧 Compose 构建应用，也不要在共享网络上随意执行 `down`、`--remove-orphans`。
 
 ---
 
@@ -354,101 +345,63 @@ curl -s http://127.0.0.1:3210/api/skills | python3 -m json.tool | head -20
 
 ---
 
-## 协作流程（分支 → 部署实测 → PR → 合并）
+## 协作流程（分支 → 验证 → PR → 部署）
 
-多人协作时，**服务器不从本地推文件，而是从 GitHub 拉取**。
-本仓库自带部署脚本 `tools/qqdeploy.py`（服务器上装为 `/usr/local/bin/qqdeploy`），
-它把"下载 → 校验 → 重建 → 健康检查 → 失败自动回滚"整条链路固化下来。
+代码先进入 Git，再部署到服务器。贡献者向约定的协作仓库提交 PR；自己的 fork 与部署器允许的仓库必须明确区分，管理员安装部署器时核对其仓库配置。
 
-### 为什么不让服务器直接当编辑环境
-
-服务器上的改动**不在版本控制里**。真发生过一次：升级到 0.4.0 时全量替换源码，
-把只在旧版上实现过的"连续对话窗口"整个弄丢了（配置项还在、功能没了，表现为
-"@ 之后没反应"）。所以规矩是：**改动一律先有 git 副本，再部署**。
-
-### 贡献者（有服务器权限时）
+### 贡献者本地验证
 
 ```bash
-git clone https://github.com/viuuro/qq-agent-xiaoruan.git && cd qq-agent-xiaoruan
-git checkout -b feat/你的改动
-
-# ── 改代码 ──
-# 注意：README.md / .gitignore / .gitattributes 是**生成物**，
-#      改文档请改 tools/repo-readme.md（否则下次生成会被守卫拦下）
-
-# ── 本地自测（不需要服务器、不需要 QQ）──
-cd app && npm install && node src/server.js    # 控制台 http://127.0.0.1:3210
-cd .. && node tools/test-chat-window-v5.mjs    # 窗口判定/概率：35 项
-       node tools/test-window-timing.mjs       # 窗口计时：21 项
-       python tools/check-modules.py app/src   # 模块依赖图
-
-git add -A && git commit -m "说明改了什么、为什么"
-git push origin feat/你的改动
+git checkout -b fix/你的改动
+npm install --prefix app
+node tools/test-chat-window-v5.mjs
+node tools/test-window-timing.mjs
+python3 tools/check-modules.py app/src
+git diff --check
 ```
 
-### 贡献者（有服务器权限时）：部署到服务器实测
+有行为变更时运行对应回归测试。PR 写清问题、变化、测试结果和兼容性影响。README 的源文件是 `tools/repo-readme.md`。合并与部署分开进行，不从本地整目录覆盖服务器。
+
+### 管理员安装可信部署工具
+
+从已审核的仓库副本运行安装器，显式提供协作者账户和公钥；不再使用内置第三方密钥：
 
 ```bash
-ssh dev@<服务器>                 # 用 SSH 密钥登录，不需要密码
-
-sudo qqdeploy --dry-run feat/你的改动   # ① 先演练：只构建镜像，不动线上
-sudo qqdeploy feat/你的改动             # ② 正式部署（约 4 分钟）
-sudo qqdeploy --status                  # ③ 看结果与健康状态
+sudo bash tools/setup-deploy-access.sh --user dev --pubkey-file /path/to/collaborator.pub
 ```
 
-部署脚本会依次做：取锁（防并发）→ 从 GitHub 下载该分支 → 语法与模块依赖校验
-→ 生成该 release 的 compose → 切换 `current` 软链 → 无缓存重建 → 健康检查
-（容器在跑 / OneBot 已连 / 插件未丢）。**校验或健康检查不过会自动切回上一版**。
+安装器维护 root 所有且协作者不可写的 `/usr/local/bin/qqdeploy`、可信校验器和构建模板。代码校验使用受限账户，分支中的脚本不能作为宿主 root 执行。安装器不会静默撤销已有组权限；管理员需核对旧的 Docker 组及 sudo 授权，安排新会话生效，并保留可用管理通道。
 
-然后去 QQ 群实测。有问题就改代码、再推、再 `sudo qqdeploy` 一次。
+部署源由管理员在 `/etc/qqdeploy/repositories.json` 的 `allowed` 与 `default` 中配置，默认是 `viuuro/qq-agent-xiaoruan`。要部署自己的 fork，先由管理员审核并更新配置；调用者环境变量不能替换部署仓库。
 
-> ⚠️ **两条硬规矩**
-> 1. **同一时刻只有一个人部署。** 脚本有 `flock` 独占锁，第二个会被明确拒绝 ——
->    看到"另一个部署正在进行中"就等一下。
->    （服务器只有 1.6G 内存，跑不了两个实例；同一个 QQ 号也只能登一处。）
-> 2. **不要手改 `/opt/qq/current` 或 `releases/` 里的文件。** 那是部署产物，
->    手改脱离版本控制，下次部署即丢失。要改就走分支。
-
-### 维护者：合并 PR
-
-实测通过后，贡献者开 PR；确认无误合并到 `main`。合并后服务器**不会自动更新**：
+### 部署与失败恢复
 
 ```bash
-ssh root@<服务器>
-sudo qqdeploy main          # 与仓库 main 对齐
-sudo qqdeploy --status      # 确认
+sudo qqdeploy --dry-run main
+sudo qqdeploy main
+sudo qqdeploy --status
+sudo qqdeploy --rollback
+sudo qqdeploy --rollback <完整或唯一前缀SHA>
+sudo qqdeploy --list
 ```
 
-### 回滚
+部署器把分支固定到完整 SHA，校验源码并构建对应版本镜像，构建成功后才切换容器。演练不切换容器或生产部署记录。健康检查验证容器、OneBot 和部署前启用的插件清单；初始没有插件是合法情况。
 
-部署脚本每次都会保留历史版本，回滚是**切软链 + 重建**，不需要重新下载：
+构建、切换或健康检查失败时，工具尝试恢复原版本并验证。**只有恢复健康后才报告回滚成功**；恢复失败会明确报错并保留操作记录，管理员根据实际容器、软链及记录处理。首次接管没有可回退版本时拒绝把“没有旧版本”当作恢复成功。
+
+`releases/` 默认保留最近 8 个版本，当前和上一个版本受保护。回滚目标必须是受管理目录中的已知 release，不能传任意服务器目录。部署锁覆盖切换和恢复全过程。
+
+### 权限与运维入口
+
+协作者不需要 Docker socket、通用 Docker CLI 或完整 sudo。已有的 Docker 组成员资格需由管理员审计撤销；仅安装新版脚本不会自动消除旧权限。
 
 ```bash
-sudo qqdeploy --rollback              # 回到上一个部署过的版本
-sudo qqdeploy --rollback <commit-sha> # 回到指定版本（需仍在 releases/ 里）
-sudo qqdeploy --list                  # 看有哪些版本可回
+sudo qqdeploy --logs qq-agent
+sudo qqdeploy --logs napcat
+sudo qqdeploy --restart-napcat
 ```
 
-脚本对"构建失败"和"健康检查不过"都会**自动回滚**，所以正常情况下你不需要手动操作；
-`--rollback` 是给"部署成功但行为不对"这种情况用的。
-
-`releases/` 默认保留最近 8 个版本，数据目录（`qq-agent-data`、`qq-agent-plugins`）
-始终是独立挂载，重建容器不会触碰。
-
-### 服务器权限模型
-
-| 项 | 说明 |
-|---|---|
-| 账号 | 普通用户 `dev`（uid 1000，属主 docke 组），**不给 root 密码** |
-| 登录 | 仅 SSH 公钥（`~dev/.ssh/authorized_keys`） |
-| sudo | **只放行 `/usr/local/bin/qqdeploy` 一条命令**，等价于"能部署代码"，不是完整 root |
-| 权限自检 | `sudo -l -U dev` 可核对；`sudo -n bash` / `sudo -n cat /etc/shadow` 应当被拒绝 |
-
-一次性安装（管理员执行，幂等）：
-
-```bash
-sudo bash tools/setup-deploy-access.sh    # 见文件头的说明
-```
+日志入口只允许固定容器和受限输出；NapCat 重启会短暂断开 QQ，执行前与其他协作者协调。管理员应核实 SSH host key 指纹，并维护授权公钥与部署账户，禁止共享 root 密码。
 
 ---
 
@@ -464,14 +417,19 @@ sudo bash tools/setup-deploy-access.sh    # 见文件头的说明
 | `audit-sessions.py` | 审计会话记录与实际行为是否自洽（例如"标记未触发却发了消息"） |
 | `prepare-upgrade.py` | 跨版本升级前准备候选源码（复制 + 打补丁 + 依赖校验） |
 | `fix-prompt-restore.py` / `fix-prompt-final.py` | 从基线恢复源码并重新应用角色卡补丁（事故恢复用） |
-| `ops-sanitize.py` | 生成脱敏后的运维脚本（把硬编码的 WebUI token 抽成从 `.env` 读） |
+| `ops-sanitize.py` | 从仓库运维源文件生成不含凭据的运维包，拒绝覆盖源码或复制外部旧快照 |
 | `prepare-repo.py` | 生成本仓库内容（只收源码与文档 + 安全检查 + README 守卫），模板在 `tools/repo-readme.md` |
 | `ssh_exec.py` | 用 paramiko 执行远程命令/传文件（Windows 自带 ssh 拒绝从管道读密码，故需要它） |
 | `qqdeploy.py` | **部署脚本**（服务器上装为 `/usr/local/bin/qqdeploy`）：从 GitHub 拉分支 → 校验 → 重建 → 健康检查 → 失败自动回滚。见「协作流程」 |
-| `setup-deploy-access.sh` | 一次性给协作者开最小权限：建 `dev` 用户 + 装 SSH 公钥 + **只放行 qqdeploy 一条 sudo** |
-| `retire-legacy-compose.sh` | 从「仓库自带 compose」迁到「qqdeploy 管理」：生成 napcat 独立入口、旧 compose 改名退役、**全程不重启容器**。见「两种部署形态」 |
+| `setup-deploy-access.sh` | 安装可信部署工具及受限校验账户；显式指定协作者与公钥，不新增 Docker 组授权 |
+| `retire-legacy-compose.sh` | 核对 qqdeploy 已接管及实际挂载后安全退役旧入口，不自动迁移数据或重启容器 |
 | `README-部署.md` | **协作者部署说明的源文件**（服务器 `~/README-部署.md` 由它生成；服务器 IP 用占位符，避免入仓泄露） |
-| `selfcheck-qqdeploy.py` | qqdeploy 的静态自查（未导入模块、危险 API 用法） |
+| `selfcheck-qqdeploy.py` | qqdeploy 的语法、危险解包及检查器调用静态自查，不代替行为测试 |
+| `test-qqdeploy.py` | 使用临时目录和 mock 验证部署、恢复、插件基线与权限边界 |
+| `test-headless-smoke.mjs` | 安装应用依赖后运行；隔离源码与数据，使用本地模拟 OneBot 验证无头启动及 HTTP 接口 |
+| `test-linux-ops.py` | Linux 上隔离验证退役、守护状态、令牌兼容与运维包生成，不调用真实 Docker |
+| `test-runtime-regressions.mjs` | 验证真实 @ 标记、插件失败重载、ZIP 限额/目录及备注删除 |
+| `test-prepare-repo.py` | 验证 README 保护、输出目录边界与协作文档保留 |
 | `export-config-template.py` | 把运行中的配置导出成脱敏模板（`deploy/config.example.json` 就是这么来的） |
 
 ### ⚠️ 改 README 请改模板，不要改 `README.md`
@@ -483,16 +441,16 @@ tools/repo-readme.md   ──(python tools/prepare-repo.py)──▶   README.md
       ↑ 这才是源文件                                              ↑ 会被覆盖
 ```
 
-直接编辑 `README.md`（包括在 GitHub 网页上编辑）**改动会在下次生成时被覆盖**。
+直接编辑 `README.md`（包括在 GitHub 网页上编辑）会触发覆盖保护；应把改动同步到源模板。
 
 为防这类误操作，`prepare-repo.py` 在覆盖前会做**三层守卫**，任意一层判定"有未同步的
-手工改动"就**中止本次生成且不覆盖**，并打印差异与两种处理办法：
+手工改动"就**保留原 README，继续生成其余产物并以非零状态退出**，并打印差异与两种处理办法：
 
 | 层 | 检查 | 能抓到什么 |
 |---|---|---|
-| 1 | `git diff --quiet -- README.md` | 本地改了 `README.md` 但还没提交 |
-| 2 | `git show HEAD:README.md` ≠ 模板内容 | **改了并提交了，但没回写模板**（网页端编辑就是这种） |
-| 3 | 输出目录不是 git 仓库时，直接比对磁盘 | 无版本历史可查时的兜底 |
+| 1 | 正文哈希与生成指纹比较 | 直接改了 README，即使模板也同时更新仍保护原文 |
+| 2 | 无指纹时比较 Git 工作区与提交内容 | 旧生成物中未同步到模板的修改 |
+| 3 | 无法证明来源且正文不同 | 保留旧手写文件，显式确认后才可强制覆盖 |
 
 拦下来之后两条路：
 
@@ -524,13 +482,14 @@ python tools/prepare-repo.py --force-readme
 3. **通过 NapCat WebUI 接口问账号是否真的登录着** ← 最关键的判据
 4. 日志里最后一次「账号状态变更」是否已被后续登录覆盖
 
-输出三态，写进 `/opt/qq/napcat-status.txt`，并在**状态发生变化时**往 journald 写 `[NAPWARN]`：
+输出四态，写进 `/opt/qq/napcat-status.txt`，并在**状态发生变化时**往 journald 写 `[NAPWARN]`：
 
 | 状态 | 含义 |
 |---|---|
 | `OK` | 容器在跑、端口在听、账号已登录 |
 | `KICKED` | 被腾讯踢下线，NapCat 停在二维码页，**需要人工扫码** |
 | `DOWN` | 容器或端口异常（NapCat 通常会自动重启） |
+| `UNKNOWN` | 登录查询失败或证据不足；不能视为已登录，需要检查 WebUI 及凭据 |
 
 三个踩过的坑，代码里都有注释标注：
 
@@ -559,7 +518,7 @@ sudo apt-get install -y python3-qrcode    # 或 pip3 install qrcode[pil]
 
 > **凭据处理**：这两个脚本都需要 NapCat WebUI 的 token，但**仓库里不写明文** ——
 > `napcat-guard.sh` 从 `/opt/qq/.env` 读 `WEBUI_TOKEN`，`qr-server.service` 用
-> `EnvironmentFile=/opt/qq/.env` 注入 `NAPCAT_WEBUI_TOKEN`。
+> `EnvironmentFile=/opt/qq/.env` 注入 `WEBUI_TOKEN`（兼容旧的 `NAPCAT_WEBUI_TOKEN`）。
 > `.env` 在 `.gitignore` 里，绝不应该入库。
 
 ### 查看状态
@@ -600,7 +559,7 @@ systemctl list-timers napcat-guard.timer           # 下次检查时间
 10. **生成物要防手改**：只要一个文件是"生成物"，就一定会有人在它身上直接改
     （尤其在 GitHub 网页上，改 README 比改模板顺手得多）。光写一句"请改模板"没用，
     要在覆盖前**主动检测并中止**：比对工作区、比对最后一次提交、比对模板三者，
-    任一不一致就停下并打印差异。见 `guard_generated_readme()`。
+    任一不一致就保护原 README 并打印差异。见 `guard_generated_readme()`。
     另一个容易忽略的点：**守卫必须跑在"清理输出目录"之前** —— 清理一执行，
     用于比对的旧文件就没了。
 11. **`docker compose` 的容器归属由「项目名」决定，不是由文件名决定**：

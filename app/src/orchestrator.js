@@ -11,7 +11,10 @@
 import { getConfig, storeConfigForChat, personaForChat } from './config.js';
 import { vendorOfConfig } from './model-prices.js';
 import { randInt } from './util.js';
-import { buildSystemPrompt, buildUserPrompt, resolveContextTier, resolveWithChatWindow, isAtMe } from './prompt.js';
+import {
+  buildSystemPrompt, buildUserPrompt, resolveContextTier, resolveWithChatWindow,
+  isChatWindowSummon
+} from './prompt.js';
 import { chatCompletion, chatCompletionWithRetry, addUsage, isRetryableError } from './llm.js';
 import { buildToolDefs, toOpenAiTools, executeTool } from './tools.js';
 import { modelImageVerdict } from './vision-scan.js';
@@ -344,8 +347,7 @@ export class Orchestrator {
     const now = Date.now();
     const untilIn = this.chatWindowUntil.get(chatKey) || 0;
     // 召唤 = 被艾特，或档位判定本身就是"关键词命中"（2 档的召唤方式之一）
-    const atMe = triggerEntries.some((e) => isAtMe(e?.text, atCtx))
-      || base.reason === '关键词命中';
+    const atMe = isChatWindowSummon(triggerEntries, atCtx, base);
 
     // 窗口内接话概率（优先级从高到低）：
     //   1) chatWindowProbByGroup[群号]  —— 分群覆盖（群号从 chatKey 里取，private: 不适用）

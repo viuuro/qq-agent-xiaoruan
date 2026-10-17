@@ -390,7 +390,7 @@ async function openMemberNoteModal(qq, chatKey) {
     const nextNotes = { ...(state.config?.memberNotes || {}) };
     if (name) nextNotes[String(qq)] = name; else delete nextNotes[String(qq)];
     try {
-      const data = await api('/api/config', { method: 'POST', body: JSON.stringify({ memberNotes: nextNotes }) });
+      const data = await api('/api/config', { method: 'POST', body: JSON.stringify({ memberNotes: { __replace__: nextNotes } }) });
       state.config = data.config;
       closeModelModal(overlay);
       await loadGroupMembers(chatKey.split(':')[1] || '', chatKey);
@@ -403,7 +403,7 @@ async function openMemberNoteModal(qq, chatKey) {
     const nextNotes = { ...(state.config?.memberNotes || {}) };
     delete nextNotes[String(qq)];
     try {
-      const data = await api('/api/config', { method: 'POST', body: JSON.stringify({ memberNotes: nextNotes }) });
+      const data = await api('/api/config', { method: 'POST', body: JSON.stringify({ memberNotes: { __replace__: nextNotes } }) });
       state.config = data.config;
       closeModelModal(overlay);
       await loadGroupMembers(chatKey.split(':')[1] || '', chatKey);

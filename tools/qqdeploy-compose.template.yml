@@ -1,0 +1,25 @@
+# Installed as a root-owned qqdeploy template; placeholders are replaced by qqdeploy.
+services:
+  qq-agent:
+    build:
+      context: __QQDEPLOY_CONTEXT__
+      dockerfile: __QQDEPLOY_DOCKERFILE__
+    image: __QQDEPLOY_IMAGE__
+    container_name: qq-agent
+    restart: always
+    environment:
+      - TZ=Asia/Shanghai
+      - NODE_ENV=production
+      - QQ_AGENT_DATA_DIR=/app/data
+      - QQ_AGENT_BIND_HOST=0.0.0.0
+    ports:
+      - 127.0.0.1:3210:3210
+    volumes:
+      - __QQDEPLOY_DATA_MOUNT__
+      - __QQDEPLOY_PLUGINS_MOUNT__
+    networks: [qqnet]
+
+networks:
+  qqnet:
+    external: true
+    name: qq_qqnet

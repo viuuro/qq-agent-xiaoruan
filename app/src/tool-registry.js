@@ -28,10 +28,9 @@ import { SKILL_ERROR, skillErrorText } from './skills/errors.js';
 // 无循环依赖 —— manager.js 只 import registry/capabilities/config/errors，不碰本文件。
 import { skillManager as defaultSkillManager } from './skills/manager.js';
 
-const registry = new Map();
+let registry = new Map();
 
-/** 注册一个工具。重复注册同 id 会覆盖（后注册的生效）。 */
-export function registerTool(def) {
+function normalizeToolDefinition(def) {
   if (!def?.id) throw new Error('工具必须提供 id');
   if (!def?.name) throw new Error(`工具 ${def.id} 必须提供 name`);
   if (typeof def?.execute !== 'function') throw new Error(`工具 ${def.id} 必须提供 execute 函数`);
@@ -40,7 +39,7 @@ export function registerTool(def) {
   if (!/^[a-zA-Z0-9_-]{1,64}$/.test(String(def.id))) {
     throw new Error(`工具 id 不符合 OpenAI 函数名规范 [a-zA-Z0-9_-]{1,64}：${def.id}`);
   }
-  registry.set(def.id, Object.freeze({
+  return Object.freeze({
     category: 'system',
     icon: '🔧',
     defaultEnabled: true,
@@ -53,7 +52,40 @@ export function registerTool(def) {
     // 与 skillId 的区别：skillId 是"谁注册的"，requires 是"运行时必须有什么能力"。
     requires: [],
     ...def
-  }));
+  });
+}
+
+/** 校验并规范化工具定义，不写入全局注册表（供插件暂存阶段使用）。 */
+export function validateToolDefinition(def) {
+  return normalizeToolDefinition(def);
+}
+
+/** 注册一个工具。重复注册同 id 会覆盖（后注册的生效）。 */
+export function registerTool(def) {
+  const normalized = normalizeToolDefinition(def);
+  registry.set(normalized.id, normalized);
+  return normalized.id;
+}
+
+/**
+ * 原子替换一个 Skill 的工具集合。
+ * 所有新定义先在副本中验证和组装；任何校验失败都不会改变当前注册表。
+ */
+export function replaceToolsBySkill(skillId, definitions = []) {
+  const prepared = definitions.map(normalizeToolDefinition);
+  const id = String(skillId);
+  if (prepared.some((def) => def.skillId !== id)) {
+    throw new Error(`工具替换集合必须全部属于 Skill ${id}`);
+  }
+
+  const replacementIds = new Set(prepared.map((def) => def.id));
+  const next = new Map(registry);
+  for (const def of prepared) next.set(def.id, def);
+  for (const [toolId, def] of next) {
+    if (def.skillId === id && !replacementIds.has(toolId)) next.delete(toolId);
+  }
+  registry = next;
+  return [...replacementIds];
 }
 
 /** 注销单个工具。 */

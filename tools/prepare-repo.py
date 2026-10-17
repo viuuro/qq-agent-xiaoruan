@@ -58,6 +58,55 @@ def copy_tree(src, dst, skip=()):
     return n
 
 
+def validate_output_dir(out_dir):
+    """生成器只能管理独立输出目录，不能清理源码或运行数据。"""
+    output = os.path.realpath(out_dir)
+    workspace = os.path.realpath(WS)
+    sources = [os.path.realpath(APP), os.path.join(workspace, "tools"),
+               os.path.join(workspace, "deploy")]
+
+    def contains(parent, child):
+        try:
+            return os.path.commonpath([parent, child]) == parent
+        except ValueError:  # Windows 上位于不同盘符
+            return False
+
+    if contains(output, workspace):
+        raise ValueError("输出目录不能是工作区本身或其父目录")
+    for source in sources:
+        if contains(output, source) or contains(source, output):
+            raise ValueError("输出目录不能与源码目录重叠：%s" % source)
+    for entry in ["data", "plugins", "skills", "napcat", ".env",
+                  "app/data", "app/plugins", "app/skills", "deploy/data",
+                  "deploy/plugins", "deploy/napcat", "deploy/.env"]:
+        if os.path.lexists(os.path.join(output, *entry.split("/"))):
+            raise ValueError("输出目录含运行数据，拒绝清理：%s" % entry)
+    return output
+
+
+def clean_generated_output(out_dir, preserve_readme=False):
+    """仅清理本工具拥有的产物；协作文档、Git 元数据及未知文件原样保留。"""
+    managed = {"app", "tools", "deploy", ".gitignore", ".gitattributes",
+               "persona-deepseek-xiaojingyu.md",
+               "persona-xiaoruan-software-association.md"}
+    if not preserve_readme:
+        managed.add("README.md")
+    output = validate_output_dir(out_dir)
+    for name in sorted(managed):
+        target = os.path.join(output, name)
+        if not os.path.lexists(target):
+            continue
+        if os.path.islink(target):
+            os.unlink(target)
+        elif os.path.isdir(target):
+            # name 来自固定清单，且输出已校验为独立目录。
+            if os.path.commonpath([output, os.path.realpath(target)]) != output:
+                raise ValueError("生成目标越出输出目录：%s" % target)
+            shutil.rmtree(target)
+        else:
+            os.remove(target)
+
+
 def read_text(p):
     with io.open(p, "r", encoding="utf-8", errors="replace") as fh:
         return fh.read()
@@ -100,7 +149,8 @@ def _norm(s):
 # 生成物里嵌入的来源标记。它记录"这份 README 是从哪个版本的模板生成的"。
 # 有了它，守卫就能区分两种完全不同的情况：
 #   · 标记 == 当前模板哈希 且 内容不同  → README 被手改了      → 拦住
-#   · 标记 != 当前模板哈希 且 内容不同  → 模板被编辑了（正常）  → 放行
+#   · 正文仍匹配旧生成指纹、模板哈希改变 → 模板被编辑了（正常）→ 放行
+#   · 正文不匹配自己的生成指纹 → 手工改动，即使模板也变化仍保护
 # 没有这个标记就只能靠"两者是否相同"判断，会把"模板正常前进"也误拦。
 GENERATED_MARKER_FMT = "<!-- generated-from: tools/repo-readme.md sha256:{hash} -->"
 GENERATED_MARKER_RE = re.compile(
@@ -160,7 +210,7 @@ def guard_generated_readme(out_dir, template_path, force=False):
 
     Returns:
         (ok, action, snapshot)
-          ok       False 表示应当中止
+          ok       False 表示保护 README；调用方可继续生成其它产物
           action   给日志用的一句话
           snapshot (模板文本, 磁盘上的 README 文本)；README 不存在时为 None。
                    调用方**必须**用返回值里的快照，别在清理目录之后再读磁盘 ——
@@ -191,17 +241,18 @@ def guard_generated_readme(out_dir, template_path, force=False):
     tmpl_h = template_hash(tmpl_text)
     marker_h = marker_hash_of(disk_text)
 
-    if marker_h is not None and marker_h != tmpl_h:
+    if (marker_h is not None and marker_h != tmpl_h
+            and template_hash(disk_body) == marker_h):
         return True, ("模板已更新（指纹 %s… → %s…），README 重新生成"
                       % (marker_h[:8], tmpl_h[:8])), snapshot
 
     findings = []
 
     if marker_h is not None:
-        # 有标记且与当前模板一致，内容却不同 → 一定是在 README 上直接改的
+        # 先核实正文仍与它自己的生成指纹相符；模板和正文同时被编辑也须保护。
         findings.append(
-            "  [A] 现有 README.md 里记录着「由当前模板生成」（指纹一致），"
-            "但**内容与模板不同**。\n"
+            "  [A] 现有 README.md 的正文与其生成指纹不一致，"
+            "且**内容与当前模板不同**。\n"
             "      说明有人直接改了 README.md 而不是模板。")
     else:
         # 无来源标记（旧生成物 / 别人 clone 的）→ 退回比对提交历史的旧判据
@@ -215,8 +266,7 @@ def guard_generated_readme(out_dir, template_path, force=False):
                 findings.append(
                     "  [2] 最后一次提交里的 README.md 与当前模板**不一致**。")
         if not findings:
-            # 没标记也没检出改动 → 当作"模板前进"，放行
-            return True, "README 无来源标记，按模板前进处理", snapshot
+            findings.append("  [3] README 无生成指纹且正文不同，无法证明没有手工修改，保留原文件。")
 
     if not findings:
         return True, "未检出未同步的手工改动", snapshot
@@ -240,7 +290,7 @@ def guard_generated_readme(out_dir, template_path, force=False):
   注意：README.md 是生成物（开头那行 generated-from 标记就是证据），
        直接改它没有意义 —— 请改模板。
 """)
-    return False, "检测到直接改生成物的痕迹，已中止（未覆盖）", snapshot
+    return False, "检测到手工或来源不明内容，README 已保护（未覆盖）", snapshot
 
 
 def main():
@@ -249,6 +299,12 @@ def main():
     out_dir = args[0] if args else os.path.join(WS, "repo")
     global OUT
     OUT = out_dir
+
+    try:
+        OUT = validate_output_dir(OUT)
+    except ValueError as error:
+        print("输出目录校验失败：%s" % error)
+        return 1
 
     if not os.path.isdir(APP):
         print("找不到应用目录: %s" % APP)
@@ -268,7 +324,7 @@ def main():
     #    排查起来很绕。最后统一以非 0 退出码提示"README 没写"。
     here = os.path.dirname(os.path.abspath(__file__))
     tmpl = os.path.join(here, "repo-readme.md")
-    readme_snapshot = None          # (磁盘上的 README 文本, 模板文本) 或 None
+    readme_snapshot = None          # (模板文本, 磁盘上的 README 文本) 或 None
     readme_blocked = False
     if os.path.exists(tmpl):
         ok, why, snapshot = guard_generated_readme(OUT, tmpl, force=force_readme)
@@ -281,18 +337,8 @@ def main():
         readme_blocked = True
 
     if os.path.isdir(OUT):
-        # ⚠️ 不能整目录删 —— repo/ 是 git 仓库，rmtree 会连 .git 一起删掉，
-        #    而且递归强删在 Windows 上常因只读属性失败。
-        #    这里逐个删"顶层条目"，显式跳过 .git。
-        print("   清理旧内容（保留 .git）: %s" % OUT)
-        for name in os.listdir(OUT):
-            if name == ".git":
-                continue
-            p = os.path.join(OUT, name)
-            if os.path.isdir(p):
-                shutil.rmtree(p)
-            else:
-                os.remove(p)
+        print("   清理生成内容（保留协作文档与受保护 README）: %s" % OUT)
+        clean_generated_output(OUT, preserve_readme=readme_blocked)
     os.makedirs(OUT, exist_ok=True)
 
     # ── 1. 应用源码（跳过 snowluma / node_modules / electron） ──
@@ -341,6 +387,13 @@ def main():
         if os.path.exists(s):
             shutil.copy2(s, os.path.join(OUT, f))
             print("   %s  %d 字节" % (f, os.path.getsize(s)))
+
+    # 首次生成时带上协作规范；已有副本由贡献者维护，不覆盖其手工修改。
+    for f in ["AGENTS.md", "CODING_STANDARDS.md"]:
+        source = os.path.join(WS, f)
+        target = os.path.join(OUT, f)
+        if os.path.isfile(source) and not os.path.exists(target):
+            shutil.copy2(source, target)
 
     # ── 4. 部署配置（compose + Dockerfile） ──
     print("\n=== 4. 生成部署配置 ===")
@@ -468,7 +521,12 @@ QQ_ACCOUNT=
 
     # ── 4b. 运维脚本（已脱敏：凭据从 .env 读，不写死在文件里） ──
     print("\n=== 4b. 收集运维脚本 ===")
-    ops_src = os.path.join(WS, "ops-sanitized", "ops-sanitized")
+    # 仓库内维护的版本优先，避免外部旧快照重新引入已修复的问题。
+    ops_src = os.path.join(WS, "deploy", "ops")
+    sysd_src = os.path.join(WS, "deploy", "systemd")
+    if not os.path.isdir(ops_src):
+        ops_src = os.path.join(WS, "ops-sanitized", "ops-sanitized")
+        sysd_src = os.path.join(ops_src, "systemd")
     if os.path.isdir(ops_src):
         ops_out = os.path.join(deploy, "ops")
         sysd_out = os.path.join(deploy, "systemd")
@@ -480,7 +538,7 @@ QQ_ACCOUNT=
                 shutil.copy2(s, os.path.join(ops_out, f))
                 print("   deploy/ops/%s" % f)
         for f in ["napcat-guard.service", "napcat-guard.timer", "qr-server.service"]:
-            s = os.path.join(ops_src, "systemd", f)
+            s = os.path.join(sysd_src, f)
             if os.path.exists(s):
                 shutil.copy2(s, os.path.join(sysd_out, f))
                 print("   deploy/systemd/%s" % f)
@@ -557,10 +615,8 @@ __pycache__/
     # README 同时也是**人手会改**的文件（网页端编辑过），所以覆盖前的检查
     # 放在清理目录之前（第 0b 步）—— 那时输出目录里还留着上一版 README 可供比对。
     if readme_blocked:
-        # 守卫拦下了：**保留原有 README**（清理时已删，这里从快照写回去），
-        # 其余文件已照常生成。最后以非 0 退出码提示。
-        if readme_snapshot:
-            write(os.path.join(OUT, "README.md"), readme_snapshot[1])
+        # 守卫拒绝时清理阶段从未删除 README；中途异常也不依赖恢复步骤。
+        if os.path.exists(os.path.join(OUT, "README.md")):
             print("   README.md（保留原有内容，%d 字节 —— 守卫拦下了覆盖）"
                   % os.path.getsize(os.path.join(OUT, "README.md")))
         else:

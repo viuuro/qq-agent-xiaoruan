@@ -21,7 +21,7 @@ import { cacheHitRate } from './llm.js';
 import { isPeakHour, priceAt, resolveModelPrice, modelLabel, splitModelLabel, UNKNOWN_VENDOR } from './model-prices.js';
 import { initPriceFeed } from './price-feed.js';
 import { startTelemetryLoop } from './telemetry.js';
-import { loadPlugins, watchPlugins } from './plugin-loader.js';
+import { activateLoadedPlugins, loadPlugins, watchPlugins } from './plugin-loader.js';
 import { skillManager } from './skills/manager.js';
 import { extractCandidateUrls, dispatchMediaLinks } from './media-links.js';
 import { createRoutes } from './routes.js';
@@ -1603,27 +1603,10 @@ export function createApp({ log = console.log } = {}) {
     return port;
   }
 
-  // ── Skill 重扫：UI「刷新」按钮的唯一后端入口 ──────────────────────────
-  // 之前「刷新」只重读内存注册表（GET /api/skills），不碰磁盘 —— watcher 丢事件
-  // （目录删除重建后 fs.watch 句柄失效、网络盘、杀毒软件）时，点多少次刷新都
-  // 看不到新插件。这里把"重扫磁盘 + 激活 + 刷工具 + 重建 watcher"做成一个
-  // 幂等函数，启动流程和手动重扫共用，行为完全一致。
-  async function reloadSkills({ reason = 'manual' } = {}) {
-    const result = await loadPlugins({ log });
-    for (const st of skillManager.list()) {
-      if (st.enabled && st.loaded) {
-        try { skillManager.activate(st.id); } catch (error) { log(`[skill] 激活 ${st.id} 失败：${error?.message ?? error}`); }
-      }
-    }
+  // ── Skill 重扫与扫描结果应用 ──────────────────────────────────────────
+  function applyPluginScan(result, { reason = 'manual' } = {}) {
+    activateLoadedPlugins(result, { log });
     try { orchestrator.refreshToolDefs(); } catch { /* 刷新失败不影响主流程 */ }
-
-    // watcher 自愈：fs.watch 监听的目录被删除再重建后收不到任何事件，
-    // 这里关掉旧的重新建。热重载关闭时保持关闭（尊重用户配置）。
-    const hotReloadOn = process.env.QQ_AGENT_DEV === '1'
-      || getConfig().extensions?.hotReload !== false;
-    try { pluginWatcher?.close?.(); } catch { /* ignore */ }
-    pluginWatcher = null;
-    if (hotReloadOn) pluginWatcher = watchPlugins({ log, onReload: () => reloadSkills({ reason: 'watch' }) });
 
     if (reason !== 'boot') {
       log(`[skill] 重扫完成（${reason}）：${result.loaded.length} 成功，${result.failed.length} 失败`
@@ -1633,10 +1616,41 @@ export function createApp({ log = console.log } = {}) {
     return result;
   }
 
+  async function closePluginWatcher() {
+    const previous = pluginWatcher;
+    pluginWatcher = null;
+    try { await previous?.close?.(); } catch { /* ignore */ }
+  }
+
+  function startPluginWatcher() {
+    // watcher 自愈：fs.watch 监听的目录被删除再重建后收不到任何事件，
+    // 这里关掉旧的重新建。热重载关闭时保持关闭（尊重用户配置）。
+    const hotReloadOn = process.env.QQ_AGENT_DEV === '1'
+      || getConfig().extensions?.hotReload !== false;
+    if (hotReloadOn) {
+      pluginWatcher = watchPlugins({
+        log,
+        onReload: (result) => applyPluginScan(result, { reason: 'watch' })
+      });
+    }
+  }
+
+  // UI「刷新」与启动共用重扫入口；watcher 则直接应用它自己的扫描结果，
+  // 避免 onReload 再次扫盘造成双重 setup/生命周期调用。
+  async function reloadSkills({ reason = 'manual' } = {}) {
+    await closePluginWatcher();
+    try {
+      const result = await loadPlugins({ log });
+      return applyPluginScan(result, { reason });
+    } finally {
+      // 手动刷新也重建 watcher，修复目录删除重建后旧 fs.watch 失效的情况。
+      startPluginWatcher();
+    }
+  }
+
   async function stop() {
     // 先停掉热重载 watcher：否则 stop() 之后文件变动仍会触发重载 + 广播
-    try { pluginWatcher?.close?.(); } catch { /* ignore */ }
-    pluginWatcher = null;
+    await closePluginWatcher();
     await orchestrator.abortAll();
     orchestrator.stopReminderLoop();
     if (communitySyncTimer) clearInterval(communitySyncTimer);

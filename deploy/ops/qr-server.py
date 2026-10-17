@@ -24,10 +24,11 @@ from qrcode.constants import ERROR_CORRECT_H
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
 WEBUI_PORT = 6099
-WEBUI_TOKEN = os.environ.get("NAPCAT_WEBUI_TOKEN", "").strip()
+WEBUI_TOKEN = (os.environ.get("WEBUI_TOKEN")
+               or os.environ.get("NAPCAT_WEBUI_TOKEN") or "").strip()
 if not WEBUI_TOKEN:
     import sys
-    sys.exit("qr-server: 缺少环境变量 NAPCAT_WEBUI_TOKEN（systemd 单元里用 EnvironmentFile 从 .env 引入）")
+    sys.exit("qr-server: 缺少环境变量 WEBUI_TOKEN（兼容 NAPCAT_WEBUI_TOKEN；请检查 systemd 的 EnvironmentFile）")
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 6098
 CRED_CACHE = "/opt/qq/.qr-server-cred"

@@ -375,6 +375,25 @@ export function isAtMe(text, { selfNickname = '', botName = '', selfId = '' } = 
   return false;
 }
 
+/**
+ * 判断存档消息是否明确艾特了机器人。
+ * 新消息的 atMe 是 OneBot @ 段按 QQ 号计算出的权威标记；只有旧存档没有
+ * 这个布尔字段时，才回落到文本匹配，避免同名群友被误当成机器人。
+ */
+export function isEntryAtMe(entry, context = {}) {
+  if (entry && typeof entry.atMe === 'boolean') return entry.atMe;
+  return isAtMe(String(entry?.text ?? ''), context);
+}
+
+export function hasEntryAtMe(entries, context = {}) {
+  return (entries || []).some((entry) => isEntryAtMe(entry, context));
+}
+
+/** 窗口只由权威 @ 标记或档位判定出的关键词召唤开启。 */
+export function isChatWindowSummon(entries, context = {}, resolved = null) {
+  return hasEntryAtMe(entries, context) || resolved?.reason === '关键词命中';
+}
+
 /** 是否命中关键词（不区分大小写，空表直接 false）。 */
 export function hitKeyword(text, keywords = []) {
   const t = String(text ?? '').toLowerCase();
@@ -486,13 +505,8 @@ export function resolveContextTier({ triggerEntries = [], selfNickname = '', bot
   const rawTier = Number(c.contextTier);
   const tier = Number.isFinite(rawTier) ? Math.min(4, Math.max(1, Math.round(rawTier))) : 4;
 
-  // 被艾特（2026-09-26）：**有 atMe 标记的条目以标记为准** —— 标记来自 @ 段的
-  // QQ 号，能区分"同名不同人"（群友 @ 的人与机器人重名时不再误判为召唤）；
-  // 无标记的老存档才回落到文本包含匹配（重名仍会误判，老数据的已知局限）。
-  const atMe = (triggerEntries || []).some((e) =>
-    e && typeof e.atMe === 'boolean'
-      ? e.atMe === true
-      : isAtMe(String(e?.text ?? ''), { selfNickname, botName, selfId }));
+  // 新消息按 OneBot @ 段的 QQ 号判定；只对没有标记的旧存档回退文本匹配。
+  const atMe = hasEntryAtMe(triggerEntries, { selfNickname, botName, selfId });
   // 关键词判定剔除 @ 片段：@ 别人的名字里带关键词不该触发（词表有"鱼"
   // ≠ 群友 @ 了"摸鱼小能手"）；正文里的关键词照常命中。
   const keyword = hitKeyword((triggerEntries || []).map((e) => stripMentions(e)).join('\n'), c.keywords);
