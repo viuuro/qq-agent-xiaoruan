@@ -235,6 +235,7 @@ export function isToolEnabledLegacy(def, toolsCfg = {}) {
 export const CATEGORY_META = {
   messaging: { name: '消息发送', icon: '💬', description: '发送文字、表情、戳一戳等' },
   sticker: { name: '表情管理', icon: '😀', description: '收藏、查看、备注表情包' },
+  gallery: { name: '本地图库', icon: '🖼️', description: '管理端维护的本地图片素材库（智能体只读查看）' },
   query: { name: '消息查询', icon: '🔍', description: '查看历史消息、成员列表等' },
   memory: { name: '记忆系统', icon: '🧠', description: '记录和查询对群友的长期印象' },
   web: { name: '联网搜索', icon: '🌐', description: '搜索网页、抓取内容' },

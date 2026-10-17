@@ -7,6 +7,7 @@
 // 重构说明：所有工具通过 registerTool() 注册到 tool-registry.js，
 // 支持在设置页按卡片勾选启用/禁用。
 import { getConfig } from './config.js';
+import fs from 'node:fs';
 import { normalizeMessageList, unquoteJsonString } from './util.js';
 import { formatStickerList } from './stickers.js';
 import { skillManager } from './skills/manager.js';
@@ -16,8 +17,10 @@ import { expandForwardNodes } from './onebot.js';
 import { registerTool, listTools } from './tool-registry.js';
 import { holidayOn, upcomingHoliday } from './holidays.js';
 import { compressImage } from './image-compress.js';
+import { detectImageType } from './image-type.js';
 import { localStickerPath } from './sticker-manager.js';
 import { isGifBuffer, gifToVideoDataUrl, resolveGifRoute } from './gif-to-video.js';
+import { getGallery, galleryLimits } from './gallery.js';
 
 /** 当前配置的 GIF 选路（vision/video 开关组合，规则矩阵见 resolveGifRoute 注释）。 */
 function currentGifRoute() {
@@ -27,13 +30,22 @@ function currentGifRoute() {
 
 async function downloadImageAsDataUrl(url, timeoutMs = 30000) {
   const safeUrl = await validateImageUrl(url);
+  void timeoutMs;
   const { buffer, contentType } = await safeFetchBinary(safeUrl);
   if (!buffer || !buffer.length) throw new Error('图片内容为空');
-  // GIF 在这里分岔（规则矩阵见 resolveGifRoute）：
-  //   vision+video 都开 → 转 mp4 按 video 部件发（llm.js 自动切视频专用模型）；
-  //   只开 vision      → GIF 按图片原样发（读不了的模型由 llm.js 的"图片被拒"
-  //                      降级路径换首帧重试 —— 见 image-compat 的 llm.retry-advisor）；
-  //   vision 没开      → 看图工具整体不可用，不会被调到。
+  return imageBufferAsDataUrl(buffer, contentType);
+}
+
+/**
+ * 本地图片字节 → 模型可消费的 parts（图库的「看图」工具也复用这里）。
+ * GIF 在这里分岔（规则矩阵见 resolveGifRoute）：
+ *   vision+video 都开 → 转 mp4 按 video 部件发（llm.js 自动切视频专用模型）；
+ *   只开 vision      → GIF 按图片原样发（读不了的模型由 llm.js 的"图片被拒"
+ *                      降级路径换首帧重试 —— 见 image-compat 的 llm.retry-advisor）；
+ *   vision 没开      → 看图工具整体不可用，不会被调到。
+ */
+async function imageBufferAsDataUrl(buffer, contentType = '') {
+  if (!buffer || !buffer.length) throw new Error('图片内容为空');
   if (isGifBuffer(buffer) && currentGifRoute() === 'video') {
     const video = await gifToVideoDataUrl(buffer);
     if (video) {
@@ -51,7 +63,7 @@ async function downloadImageAsDataUrl(url, timeoutMs = 30000) {
   }
   // 大图片自动压缩（有 ffmpeg 时）：缩到模型可接受的尺寸/体积，降低 token 成本
   const compressed = await compressImage(buffer);
-  const mime = compressed.compressed ? compressed.mime : (detectMime(buffer) || String(contentType || 'image/jpeg').split(';')[0]);
+  const mime = compressed.compressed ? compressed.mime : (detectImageType(buffer)?.mime || String(contentType || 'image/jpeg').split(';')[0]);
   return {
     dataUrl: `data:${mime};base64,${compressed.buffer.toString('base64')}`,
     isGif: mime === 'image/gif',
@@ -85,12 +97,7 @@ function getImagePartsOrVideo(text, results) {
 }
 
 function detectMime(buf) {
-  if (!buf || buf.length < 12) return null;
-  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png';
-  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
-  if (buf.toString('ascii', 0, 6) === 'GIF87a' || buf.toString('ascii', 0, 6) === 'GIF89a') return 'image/gif';
-  if (buf.toString('ascii', 0, 8) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return 'image/webp';
-  return null;
+  return detectImageType(buf)?.mime ?? null;
 }
 
 function ok(payload) {
@@ -110,6 +117,17 @@ function midHint(ctx) {
   return uniq.length
     ? `消息 id 只能用聊天记录里每条消息前的 #数字（最近可见：${uniq.join(' ')}），不要自己编`
     : '聊天记录里还没有带 #id 的消息';
+}
+
+// ── 图库工具辅助 ─────────────────────────────────────────────────────────
+// 分类不存在时把已有分类一并发给模型，避免它反复猜同一个不存在的名字。
+function galleryErr(error) {
+  const message = String(error?.message ?? error);
+  const cats = error?.details?.categories;
+  if (Array.isArray(cats) && cats.length) {
+    return err(`${message}（现有分类：${cats.join('、')}）`);
+  }
+  return err(message);
 }
 
 // 需要数字 QQ 号但模型传了名字时，把当前会话真实可见的成员列出来，让它选一个。
@@ -429,6 +447,92 @@ function registerAllTools() {
         });
       } catch (error) {
         return err(error?.message ?? error);
+      }
+    }
+  });
+
+  // ── 本地图库（只读：查看 / 看图）──────────────────────────────────────
+  // 图库是管理员维护的素材库，聊天侧**只读**：没有"发图库图片"和"存入图库"工具。
+  // 群友发来的图片也不得写入图库（见 prompt.js 的入库禁令）。
+  registerTool({
+    id: 'list_gallery',
+    name: '查看本地图库',
+    description: '查看服务器上的本地图库（管理员维护，智能体只读）。返回分类列表和图片的 imageId/标题/标签，可用分类或关键词过滤。要查看某张图的画面，用 view_gallery_image。不能通过聊天把图库图片发出去，也不能把聊天图片存进来。',
+    category: 'gallery',
+    icon: '🗂️',
+    parameters: {
+      type: 'object',
+      properties: {
+        category: { type: 'string', description: '可选：只看某个分类（分类名从返回的 categories 里选）' },
+        query: { type: 'string', description: '可选：搜索标题/标签/备注/文件名' },
+        limit: { type: 'integer', description: '最多返回几张，默认 30，最大 60' }
+      }
+    },
+    async execute(ctx, args) {
+      try {
+        const gallery = getGallery();
+        const { maxList } = galleryLimits();
+        const limit = Math.min(60, Math.max(1, Number(args.limit) || maxList));
+        const data = gallery.list({
+          category: String(args.category ?? ''),
+          query: String(args.query ?? ''),
+          limit
+        });
+        const images = data.images.map((e) => ({
+          imageId: e.id,
+          title: e.title || e.originalName || '',
+          category: e.category,
+          tags: e.tags,
+          sizeKB: Math.round((Number(e.size) || 0) / 1024),
+          width: e.width,
+          height: e.height
+        }));
+        const note = data.totalAll === 0
+          ? '图库还是空的：请管理员在控制台「图库」页上传。聊天侧不能存入图片。'
+          : (data.total > images.length
+            ? `匹配 ${data.total} 张，只返回了前 ${images.length} 张；要更精确就加 category/query。`
+            : '要查看某张图的画面：view_gallery_image(imageId=...)。图库只读，不能发送或存入。');
+        return ok({
+          categories: data.categories.map((c) => `${c.name}(${c.count})`).join('、') || '（空）',
+          libraryTotal: data.totalAll,
+          matched: data.total,
+          images,
+          note
+        });
+      } catch (error) {
+        return galleryErr(error);
+      }
+    }
+  });
+
+  registerTool({
+    id: 'view_gallery_image',
+    name: '查看图库图片',
+    description: '查看图库里某张图片的画面（视觉模型可以直接看懂）。图库是管理员维护的只读素材库：只能看，不能发到聊天，也不能把聊天图片存进来。imageId 从 list_gallery 获取。',
+    category: 'gallery',
+    icon: '👁️',
+    requiresVision: true,
+    parameters: {
+      type: 'object',
+      properties: { imageId: { type: 'string', description: '图库图片 id（list_gallery 返回的 imageId）' } },
+      required: ['imageId']
+    },
+    async execute(ctx, args) {
+      try {
+        const gallery = getGallery();
+        const id = String(args.imageId ?? '').trim();
+        const entry = gallery.get(id);
+        if (!entry) return err(`图库里没有 imageId=${id} 的图片。先 list_gallery 确认。`);
+        const resolved = await gallery.resolveFile(id);
+        const buffer = fs.readFileSync(resolved.path);
+        const r = await imageBufferAsDataUrl(buffer, resolved.mime);
+        const built = getImagePartsOrVideo(`图库图片 ${entry.id}（${entry.title || entry.originalName || '未命名'}，分类：${entry.category}）：`, [r]);
+        if (r.gifVideo) {
+          built.content[0].text += `\n（这是 GIF 动图，已转成 ${r.gifVideo.frames} 帧视频输入）`;
+        }
+        return built;
+      } catch (error) {
+        return galleryErr(error);
       }
     }
   });
@@ -944,7 +1048,7 @@ function registerAllTools() {
   registerTool({
     id: 'send_image',
     name: '发送网图',
-    description: '把一张网上找到的图片发到当前聊天。默认需要先预览确认（send_image(url, preview=true) 看一眼，再 send_image(url) 发出）。只支持 png/jpg/gif/webp 直链；网页地址不是图片。',
+    description: '把一张网上找到的图片发到当前聊天。默认需要先预览确认（send_image(url, preview=true) 看一眼，再 send_image(url) 发出）。只支持 png/jpg/gif/webp/bmp 直链；网页地址不是图片。图库里的图片不能通过聊天发送（图库由管理员在管理端维护）。',
     category: 'media',
     icon: '🖼️',
     requiresVision: false,
@@ -1014,7 +1118,7 @@ function registerAllTools() {
           if (head.startsWith('<!doctype html') || head.startsWith('<html')) {
             return err('这个地址返回的是网页（HTML），不是图片直链。先用 web_fetch 抓那页，再从它返回的 images 里挑一条直链。');
           }
-          return err(`这个地址返回的不是图片（Content-Type: ${contentType || '未知'}）。只支持 png/jpg/gif/webp 直链。`);
+          return err(`这个地址返回的不是图片（Content-Type: ${contentType || '未知'}）。只支持 png/jpg/gif/webp/bmp 直链。`);
         }
 
         const b64 = buffer.toString('base64');

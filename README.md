@@ -1,4 +1,4 @@
-<!-- generated-from: tools/repo-readme.md sha256:72bd95b2b23de20c52a3b48dad5d833ecf101aa2e4f479c0bfe9c62069c52875 -->
+<!-- generated-from: tools/repo-readme.md sha256:50bf6a80ef650187d52305bcd23af3741129a6e56f121853a1c00ee22e33d207 -->
 # QQ Agent · 软协小软（定制版）
 
 ```
@@ -50,7 +50,7 @@
 一份**可直接部署的 QQ 群 AI 机器人**，以及围绕它踩过的坑与工具。
 
 机器人本体（`app/`）来自上游 [Kondius/qq-agent](https://github.com/Kondius/qq-agent)，
-本仓库在其基础上做了三处代码改动、补齐了容器化部署配置，并附带一套运维/诊断脚本。
+本仓库在其基础上做了四处改动（角色卡注入、连续对话窗口、可配置绑定地址、本地图库）、补齐了容器化部署配置，并附带一套运维/诊断脚本。
 
 ```
 app/                      应用源码（上游 0.4.0 + 本文所述改动）
@@ -133,6 +133,26 @@ persona-*.md              两份角色卡示例
 上游把控制台硬编码监听 `127.0.0.1`。这在容器里意味着宿主机端口映射连不上。
 `app/src/app.js` 改为读 `QQ_AGENT_BIND_HOST`，默认值仍是 `127.0.0.1`
 （本机裸跑行为不变），容器里由 `deploy/Dockerfile` 设为 `0.0.0.0`。
+
+### 4. 本地图库（分类文件夹 + 管理页 + 只读工具）
+
+新增一套**按文件夹分类的本地图库**：管理端负责上传 / 分类 / 删除，
+聊天侧的智能体只能**只读查看**，不能发送图库图片，也不能把聊天图片存进来。
+
+| 层 | 位置 | 做什么 |
+|---|---|---|
+| 存储 | `data/image-gallery/<分类名>/` | 分类 = 一级文件夹，图片文件直接放在里面；元数据在 `index.json` |
+| 管理端 | 控制台「图库」页签 | 存入图片、新建/重命名/删除分类、移动/编辑/删除图片、下载原图 |
+| 智能体工具 | `list_gallery` / `view_gallery_image` | 只读：查看分类与图片、查看某张图的画面 |
+
+- 支持 PNG / JPG / GIF / WebP / BMP（按文件魔数校验，不接收 SVG/HTML）；
+- **管理端是唯一写入口**：聊天侧没有 `send_gallery_image` / `save_gallery_image` 工具；
+  群成员在聊天里发的图片不会进入图库（与系统内置的图片入库禁令一致）；
+- 删除分类时若仍有图片，会要求先把图片移到「未分类」再删空文件夹；
+- 手动往分类文件夹里丢图片，管理页点「刷新」即可收录（文件夹是分类的唯一真相）；
+- 配置项：`gallery.maxFileMB`（单张上限，默认 15）、`gallery.maxList`（模型一次列多少张）、`gallery.maxCategories`；
+- 图库数据在 `data/` 挂载里，容器重建不会丢；缩略图需要服务器有 `ffmpeg`，没有则直接回退原图；
+- 测试：`node tools/test-image-gallery.mjs`、`node tools/test-gallery-routes.mjs`、`node tools/test-gallery-tools.mjs`。
 
 ---
 

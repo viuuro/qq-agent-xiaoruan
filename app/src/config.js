@@ -249,6 +249,15 @@ export const DEFAULT_CONFIG = {
     // 强制会显得机械，引导才能让它在合适的时候自然用上。
     encourage: 1
   },
+  // 本地图库（图片素材库）。
+  // 分类 = data/image-gallery/ 下的一级文件夹（管理端可命名、可增删），
+  // 元数据（标题/标签/尺寸/来源）在 index.json；图片文件本身仍是唯一实体。
+  // 这组值同时被管理端上传接口和智能体工具读取，改配置立即生效。
+  gallery: {
+    maxFileMB: 15,        // 单张图片体积上限（管理端上传）
+    maxList: 30,          // 智能体一次 list_gallery 最多看到多少张
+    maxCategories: 100     // 分类文件夹数量上限（防误建把根目录塞满）
+  },
   // 存储
   store: {
     // 单群 JSON 最大保留条数。**0 = 不限制**。
@@ -356,6 +365,7 @@ export const DEFAULT_CONFIG = {
     categories: {
       messaging: true,          // 消息发送
       sticker: true,            // 表情管理
+      gallery: true,            // 本地图库
       query: true,              // 消息查询
       memory: true,             // 记忆系统
       web: true,                // 联网搜索

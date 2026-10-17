@@ -1361,14 +1361,31 @@ async function saveConfig({ quiet = false } = {}) {
   }
 
   if (sec === 'persona') {
+    // ── 长文本字段只在"真的和已知配置不同"时才提交 ──
+    // 三个框（角色卡 / 管理员附加规则 / 覆盖提示词）的内容是从 DOM 读的，而控制台
+    // 页面的渲染时刻可能早于服务端的后续修改（另一处 API 写入、另一个标签页保存、
+    // 部署后的配置变更）。此前无 condition 回传，导致一次"旧页面保存"就用页面上的
+    // 旧值把服务端新值覆盖掉 —— 管理员附加规则曾因此连续丢失三次。
+    //
+    // 语义：DOM == 基线 → 视为没改 → 不写该字段（后端 updateConfig 是 deepMerge，
+    //       省略即保留现值）；DOM != 基线 → 用户或模板按钮真的改了 → 正常提交。
+    //       这样"清空"依然能存（DOM 为空、基线非空 → 不同 → 提交空串）。
+    const changedText = (sel, known) => {
+      const node = el(sel);
+      if (!node) return undefined;                 // 本次没渲染这个框：一律不动
+      return node.value === (known ?? '') ? undefined : node.value;
+    };
     patch.persona = {
       botName: val('#cfg-botname', c.persona.botName).trim() || '小鲸鱼',
       selfNickname: val('#cfg-selfnick', c.persona.selfNickname || '').trim(),
-      participation: val('#cfg-participation', c.persona.participation),
-      roleText: val('#cfg-roletext', c.persona.roleText || ''),
-      customRules: val('#cfg-customrules', c.persona.customRules || ''),
-      systemPromptOverride: val('#cfg-sysprompt', c.persona.systemPromptOverride || '')
+      participation: val('#cfg-participation', c.persona.participation)
     };
+    const roleTextPatch = changedText('#cfg-roletext', c.persona.roleText || '');
+    const customRulesPatch = changedText('#cfg-customrules', c.persona.customRules || '');
+    const sysPromptPatch = changedText('#cfg-sysprompt', c.persona.systemPromptOverride || '');
+    if (roleTextPatch !== undefined) patch.persona.roleText = roleTextPatch;
+    if (customRulesPatch !== undefined) patch.persona.customRules = customRulesPatch;
+    if (sysPromptPatch !== undefined) patch.persona.systemPromptOverride = sysPromptPatch;
     // 统一人设开关：编辑器随开关二选一在场，读不到的保持旧值。
     patch.personaUnified = chk('#cfg-persona-unified', c.personaUnified !== false);
     // personaByChat 不在这里收集：独立人设模态框已改为**直接 POST 落盘**（openPerChatPersonaModal

@@ -33,6 +33,7 @@ import { safeFetchBinary, browseLockState } from './safe-fetch.js';
 import { getGlobalBlocklist, updateGlobalBlocklist, FIXED_PRICE_FEED_URL } from './community.js';
 import { listAccounts, removeAccount, loginAccount, publishModule, verifyInstallCodes, installByCode } from './market.js';
 import { detectDialect as detectThinkingDialect } from './thinking.js';
+import { getGallery, galleryLimits, GalleryError } from './gallery.js';
 
 /**
  * 构建路由表。
@@ -58,6 +59,45 @@ export function createRoutes(deps) {
   // 但 readBody 明确标记的可暴露错误（400 非法 JSON / 413 过大）必须透传，
   // 否则会从"应返回 400"退化成静默当成空 patch。
   const bodyOf = (req) => readBody(req).catch((e) => { if (e?.expose) throw e; return {}; });
+
+  /**
+   * 图库上传读原始字节（不是 JSON）。
+   * 为什么不用 readBody：readBody 的硬上限是 16MB，而 base64 会把 15MB 的图撑到
+   * 20MB+，一张稍大的照片就传不上来。这里直接收二进制，内存占用与文件等大，
+   * 由 gallery.maxFileMB 单独限流；超限后继续把请求读干净（避免连接变脏），
+   * 但不再往内存里塞数据。
+   */
+  async function readRawBody(req, maxBytes) {
+    const chunks = [];
+    let size = 0;
+    let tooLarge = false;
+    for await (const chunk of req) {
+      size += chunk.length;
+      if (size > maxBytes) { tooLarge = true; chunks.length = 0; continue; }
+      if (!tooLarge) chunks.push(chunk);
+    }
+    if (tooLarge) {
+      throw new GalleryError(`图片太大，单张上限 ${Math.round(maxBytes / 1024 / 1024)}MB`, {
+        status: 413, code: 'image-too-large'
+      });
+    }
+    return Buffer.concat(chunks);
+  }
+
+  /** 图库错误 → 统一 JSON（4xx 透出原因，500 记录日志但不回栈）。 */
+  function galleryFail(res, json, error, prefix = '图库操作') {
+    const status = Number(error?.status) || 500;
+    const body = {
+      ok: false,
+      error: `${prefix}失败：${String(error?.message ?? error)}`,
+      code: error?.code || ''
+    };
+    if (error?.details && typeof error.details === 'object') Object.assign(body, error.details);
+    if (status >= 500 && typeof log === 'function') {
+      log(`[gallery] ${prefix}失败：${error?.stack ?? error?.message ?? error}`);
+    }
+    return json(res, status, body);
+  }
 
   /**
    * Skill 可用性判断的运行期上下文。
@@ -1097,6 +1137,157 @@ export function createRoutes(deps) {
           skillId: t.skillId ?? null
         }));
         return json(res, 200, { tools });
+      }
+    },
+
+    // ── 本地图库（管理端）────────────────────────────────────────────
+    // 存储目录：data/image-gallery/<分类名>/图片文件。
+    // 元数据 index.json 与图片分开，删索引可从磁盘重建；分类以文件夹为唯一真相。
+    {
+      method: 'GET', pattern: '/api/gallery',
+      handler: async ({ res, json, url }) => {
+        try {
+          const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit')) || 200));
+          const offset = Math.max(0, Number(url.searchParams.get('offset')) || 0);
+          const data = getGallery().list({
+            category: String(url.searchParams.get('category') || ''),
+            query: String(url.searchParams.get('q') || ''),
+            limit,
+            offset,
+            includeRoot: true,
+            refresh: url.searchParams.get('refresh') === '1'
+          });
+          return json(res, 200, { ok: true, ...data, limits: galleryLimits() });
+        } catch (error) {
+          return galleryFail(res, json, error, '读取图库');
+        }
+      }
+    },
+    {
+      // 图片实体（网格缩略图 / 大图预览 / 下载）。id 只允许字符集，路径由索引解析，
+      // 不接受调用方传路径 —— 这是图库唯一的文件读取出口。
+      method: 'GET', pattern: /^\/api\/gallery\/file\/([a-z0-9_-]+)$/i,
+      handler: async ({ res, json, url, match }) => {
+        try {
+          const thumb = url.searchParams.get('thumb') === '1';
+          const download = url.searchParams.get('download') === '1';
+          const r = await getGallery().resolveFile(match[1], { thumb });
+          const buf = fs.readFileSync(r.path);
+          const headers = {
+            'content-type': r.mime || 'application/octet-stream',
+            'content-length': String(buf.length),
+            'cache-control': thumb ? 'private, max-age=86400' : 'private, max-age=3600',
+            'x-content-type-options': 'nosniff'
+          };
+          if (download) {
+            const ext = path.extname(r.entry.filename) || '';
+            const fallback = `image${ext}`.replace(/[^a-zA-Z0-9._-]/g, '');
+            const name = String(r.entry.originalName || r.entry.title || fallback).slice(0, 120);
+            const encoded = encodeURIComponent(name).replace(/['()]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+            headers['content-disposition'] = `attachment; filename="${fallback}"; filename*=UTF-8''${encoded}`;
+          }
+          res.writeHead(200, headers);
+          res.end(buf);
+          return undefined;
+        } catch (error) {
+          // 图片请求失败时浏览器只会画个破图，这里返回 JSON 让 devtools 能看到原因
+          return galleryFail(res, json, error, '读取图片');
+        }
+      }
+    },
+    {
+      // 存入图片：**原始二进制**上传（不是 JSON/base64）。
+      // 查询参数：category / filename / title / tags
+      method: 'POST', pattern: '/api/gallery/images',
+      handler: async ({ req, res, json, url }) => {
+        try {
+          const { maxFileMB } = galleryLimits();
+          const buffer = await readRawBody(req, maxFileMB * 1024 * 1024);
+          if (!buffer.length) {
+            throw new GalleryError('没有收到图片数据', { status: 400, code: 'empty-image' });
+          }
+          const result = getGallery().saveBuffer(buffer, {
+            category: String(url.searchParams.get('category') || ''),
+            title: String(url.searchParams.get('title') || ''),
+            tags: String(url.searchParams.get('tags') || ''),
+            originalName: String(url.searchParams.get('filename') || ''),
+            source: 'upload',
+            // 图库**唯一**写入口：管理端上传。聊天侧的智能体工具没有写能力。
+            actor: 'admin'
+          });
+          return json(res, 200, { ok: true, duplicate: result.duplicate, image: result.entry });
+        } catch (error) {
+          return galleryFail(res, json, error, '存入图片');
+        }
+      }
+    },
+    {
+      // 改标题/描述/标签，或移动分类（移动会真的把文件搬到目标分类文件夹）
+      method: 'PATCH', pattern: /^\/api\/gallery\/images\/([a-z0-9_-]+)$/i,
+      handler: async ({ req, res, json, match }) => {
+        try {
+          const body = await bodyOf(req);
+          const patch = {};
+          for (const key of ['title', 'description', 'tags', 'category']) {
+            if (Object.prototype.hasOwnProperty.call(body, key)) patch[key] = body[key];
+          }
+          const image = getGallery().update(match[1], patch);
+          return json(res, 200, { ok: true, image });
+        } catch (error) {
+          return galleryFail(res, json, error, '修改图片');
+        }
+      }
+    },
+    {
+      method: 'DELETE', pattern: /^\/api\/gallery\/images\/([a-z0-9_-]+)$/i,
+      handler: async ({ res, json, match }) => {
+        try {
+          const r = getGallery().remove(match[1]);
+          return json(res, 200, { ok: true, ...r });
+        } catch (error) {
+          return galleryFail(res, json, error, '删除图片');
+        }
+      }
+    },
+    {
+      // 新建分类 = 在图库根目录下建一个同名文件夹
+      method: 'POST', pattern: '/api/gallery/categories',
+      handler: async ({ req, res, json }) => {
+        try {
+          const body = await bodyOf(req);
+          const r = getGallery().createCategory(String(body.name ?? ''));
+          return json(res, 200, { ok: true, ...r });
+        } catch (error) {
+          return galleryFail(res, json, error, '新建分类');
+        }
+      }
+    },
+    {
+      method: 'POST', pattern: '/api/gallery/categories/rename',
+      handler: async ({ req, res, json }) => {
+        try {
+          const body = await bodyOf(req);
+          const r = getGallery().renameCategory(String(body.from ?? ''), String(body.to ?? ''));
+          return json(res, 200, { ok: true, ...r });
+        } catch (error) {
+          return galleryFail(res, json, error, '重命名分类');
+        }
+      }
+    },
+    {
+      // 删除分类：分类非空时必须带 moveTo（先把图片移到别的分类）。
+      // 只删空目录，不递归 —— 万一目录里有非图片文件会明确报错让人处理。
+      method: 'DELETE', pattern: '/api/gallery/categories',
+      handler: async ({ req, res, json }) => {
+        try {
+          const body = await bodyOf(req);
+          const r = getGallery().removeCategory(String(body.name ?? ''), {
+            moveTo: String(body.moveTo ?? '')
+          });
+          return json(res, 200, { ok: true, ...r });
+        } catch (error) {
+          return galleryFail(res, json, error, '删除分类');
+        }
       }
     },
 

@@ -32,6 +32,10 @@ export function detectImageType(buf) {
   const head6 = sliceAscii(0, 6);
   if (head6 === 'GIF87a' || head6 === 'GIF89a') return { mime: 'image/gif', ext: '.gif' };
   if (sliceAscii(0, 4) === 'RIFF' && sliceAscii(8, 12) === 'WEBP') return { mime: 'image/webp', ext: '.webp' };
+  // BMP：图库要收的"常规格式"之一（管理端上传/从消息存入）。
+  // 只认 'BM' 魔数；PNG/JPEG/GIF/WebP 之外的新格式必须在这里加分支，
+  // 否则会被当成"不是图片"拒收。
+  if (b[0] === 0x42 && b[1] === 0x4d) return { mime: 'image/bmp', ext: '.bmp' };
   return null;
 }
 
@@ -46,6 +50,7 @@ export function mimeToExt(mime) {
     case 'image/png': return '.png';
     case 'image/gif': return '.gif';
     case 'image/webp': return '.webp';
+    case 'image/bmp': return '.bmp';
     case 'image/jpeg':
     case 'image/jpg': return '.jpg';
     default: return '.jpg';

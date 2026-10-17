@@ -531,6 +531,9 @@ const TOOL_META = {
   get_sticker_image: { name: '看表情图',   cat: '表情',   icon: '🖼️' },
   collect_sticker:   { name: '收藏表情',   cat: '表情',   icon: '⭐' },
   sticker_note:      { name: '备注表情',   cat: '表情',   icon: '📝' },
+  // 本地图库（聊天侧只读）
+  list_gallery:       { name: '看图库',       cat: '图库', icon: '🗂️' },
+  view_gallery_image: { name: '查看图库图片', cat: '图库', icon: '👁️' },
   // 记忆
   memory_append:     { name: '记一条',     cat: '记忆',   icon: '🧠' },
   memory_query:      { name: '查记忆',     cat: '记忆',   icon: '🧠' },
@@ -544,7 +547,7 @@ const TOOL_META = {
 };
 
 /** 分类的展示顺序（"其他"垫底） */
-const TOOL_CAT_ORDER = ['发言', '查看', '表情', '记忆', '联网', '其他'];
+const TOOL_CAT_ORDER = ['发言', '查看', '表情', '图库', '记忆', '联网', '其他'];
 
 /** 用量页的时间范围选项：[传给后端的值, 按钮文案] */
 const USAGE_RANGES = [
@@ -555,6 +558,15 @@ const USAGE_RANGES = [
 ];
 
 const CONSOLE_MARKER = 'qq-agent-console';
+
+/**
+ * 控制台管理令牌（可选）：配置了 server.token 时，控制台需要用 ?token=xxx 打开。
+ * 之前只有 <img>/下载链接能带查询令牌，fetch 请求永远只发 marker，等于一开令牌
+ * 整个控制台就 401。这里统一从地址栏取一次；没配置令牌时仍发 marker（服务端忽略）。
+ */
+function consoleTokenFromUrl() {
+  try { return new URL(location.href).searchParams.get('token') || ''; } catch { return ''; }
+}
 
 /* ══════════════════════════════════════════════════════════════
    主题（明/暗）—— 「跟随系统」「？」已移除
@@ -603,7 +615,7 @@ async function api(path, options = {}) {
   const res = await fetch(path, {
     headers: {
       'content-type': 'application/json',
-      'x-console-token': CONSOLE_MARKER,
+      'x-console-token': consoleTokenFromUrl() || CONSOLE_MARKER,
       ...(rest.headers || {})
     },
     ...rest,
@@ -788,6 +800,7 @@ function switchTab(name) {
   if (state.quoteMode && name !== 'chats') exitQuoteMode();   // 离开存档页自动退出金句勾选
   if (name === 'sessions') loadSessions();
   if (name === 'chats') loadChats();
+  if (name === 'gallery' && typeof loadGalleryView === 'function') loadGalleryView();
   // 群名补底：设置页（人设分群按钮/活跃设置分群下拉）用 chatNameOf 取名字，
   // 依赖 state.chats —— 若用户没先进过存档页这里是空的，会只显示群号。
   // 进设置页时悄悄拉一次（quiet，失败不报错），列表已在就跳过。
