@@ -72,6 +72,7 @@
   <nav id="tabs">
     <button class="tab active" data-tab="sessions">会话</button>
     <button class="tab" data-tab="chats">存档</button>
+    <button class="tab" data-tab="gallery">图库</button>
     <button class="tab" data-tab="memory">记忆</button>
     <button class="tab" data-tab="usage">用量</button>
     <button class="tab" data-tab="skills">技能</button>
@@ -113,6 +114,11 @@
       <div id="chat-detail" class="detail-pane">
         <div class="empty-hint">← 选择会话查看消息存档</div>
       </div>
+    </section>
+
+    <!-- 图库视图：分类文件夹 + 图片网格 + 存取/移动/删除/改名 -->
+    <section id="view-gallery" class="view">
+      <div id="gallery-page" class="usage-pane"></div>
     </section>
 
     <!-- SnowLuma 视图 -->
@@ -171,6 +177,7 @@
   <script defer src="/app/09-community.js"></script>
   <script defer src="/app/10-feedback.js"></script>
   <script defer src="/app/12-concept2-ui.js"></script>
+  <script defer src="/app/13-gallery.js"></script>
   <script defer src="/app/11-init.js"></script>
 
   <!-- 阿里云验证码 2.0（意见收集/金句上传共用）：容器常驻；AliyunCaptchaConfig 与

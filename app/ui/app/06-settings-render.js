@@ -435,7 +435,13 @@ function renderPersonaSection(c) {
     <div class="field"><label>角色设定</label>
       <textarea id="cfg-roletext" class="persona-role-text" placeholder="例如：你是运维群里的老油条……">${esc(c.persona.roleText || '')}</textarea></div>
     <div class="field"><label>管理员附加规则（可选，追加到系统提示）</label>
-      <textarea id="cfg-customrules" class="persona-role-text" style="min-height:100px">${esc(c.persona.customRules || '')}</textarea></div>
+      <textarea id="cfg-customrules" class="persona-role-text" style="min-height:100px">${esc(c.persona.customRules || '')}</textarea>
+      <div class="hint">
+        「图片 / 表情包入库禁令」和图库权限（聊天侧只能看、只有管理端能上传）已经<b>内置在代码里</b>，
+        不需要在这里再写一遍 —— 重复填写只会让系统提示变长，并可能与内置规则产生措辞冲突。
+        这里只放你自己额外的规则。
+      </div>
+    </div>
     <div class="field">
       <label>系统提示词覆盖（高级 · 可选）</label>
       <textarea id="cfg-sysprompt" class="persona-role-text" style="min-height:120px" placeholder="留空 = 使用内置默认系统提示词（含安全规则/工具协议/反AI味等）。填写后将整体替换默认行为准则。">${esc(c.persona.systemPromptOverride || '')}</textarea>
@@ -1548,13 +1554,14 @@ function renderToolsSection(c) {
   const skillActive = new Map((state.skills || []).map((s) => [s.id, s.active === true]));
   const tools = (state.toolRegistry || []).filter((t) => !t.skillId || skillActive.get(t.skillId) === true);
   const toolsCfg = c.tools || {};
-  // 分类清单必须与 tool-registry 的 CATEGORY_META 同源（8 类）：
+  // 分类清单必须与 tool-registry 的 CATEGORY_META 同源（9 类）：
   // 曾经只列 6 类，media/knowledge 两类的工具（send_image、bili-meme 等）
   // 在设置页无卡片 → 无分类开关也无单工具开关，只能手改 JSON。
-  const categories = ['messaging', 'sticker', 'query', 'memory', 'web', 'knowledge', 'media', 'system'];
+  const categories = ['messaging', 'sticker', 'gallery', 'query', 'memory', 'web', 'knowledge', 'media', 'system'];
   const categoryNames = {
     messaging: '💬 消息发送',
     sticker: '😀 表情管理',
+    gallery: '🖼️ 本地图库',
     query: '🔍 消息查询',
     memory: '🧠 记忆系统',
     web: '🌐 联网搜索',
