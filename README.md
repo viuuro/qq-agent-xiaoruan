@@ -1,4 +1,4 @@
-<!-- generated-from: tools/repo-readme.md sha256:30a716d50ebc184e5a7f4d9e6464cc8f3abb69caa332f9ed0d9de4827df8e45c -->
+<!-- generated-from: tools/repo-readme.md sha256:ed702f1b3921ce8e3a9c5f8944602e871ae6f7e1853389ae5121082ce8be7e06 -->
 # QQ Agent · 软协小软（定制版）
 
 ```
@@ -511,6 +511,7 @@ sudo bash tools/setup-deploy-access.sh    # 见文件头的说明
 | `export-config-template.py` | 把运行中的配置导出成脱敏模板（`deploy/config.example.json` 就是这么来的） |
 | `sync-knowledge.py` | 把 `knowledge/` 里的文档同步进机器人知识库（服务器上装为 `sync-knowledge`）。**部署不会自动带过去，必须显式跑一次** |
 | `probe-kb-search.mjs` | 验证知识库能否检索到指定内容（调插件真实的 buildIndex/search）。改完知识库用它确认，别只看 .index.json |
+| `render-readme.py` | **只**从模板渲染 `README.md`（不动其它文件）。合并分支时 README 必然冲突（生成物含指纹行），用它取代手工挑冲突 |
 
 ### ⚠️ 改 README 请改模板，不要改 `README.md`
 
