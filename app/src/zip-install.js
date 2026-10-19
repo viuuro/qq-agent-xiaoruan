@@ -8,21 +8,26 @@ import path from 'node:path';
 import { inflateRawSync } from 'node:zlib';
 
 const BANNED_EXT = /\.(exe|dll|bat|cmd|ps1|vbs|sh)$/i;
+const MODULE_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
 const MAX_FILES = 100;
 const MAX_TOTAL = 32 * 1024 * 1024;
 
 /**
- * 结构校验（抛错 = 拒绝安装）：
- *   · zip 中央目录里的每个条目：禁绝对路径/..、禁可执行后缀
- *   · 文件数与解压总量上限（zip 炸弹防护）
- * 返回 [{ name, data }]（仅文件条目，目录跳过）。
+ * 解压前校验中央目录元数据，不读取解压内容。
+ * 返回仅含文件的描述符；真正解压时按剩余总量限制 zlib 输出。
  */
 export function validateZipStructure(buffer) {
-  const entries = parseZip(buffer);
-  if (entries.length > MAX_FILES) throw new Error(`文件数量过多（${entries.length} > ${MAX_FILES}）`);
+  const entries = parseZipDirectory(buffer);
   let total = 0;
-  for (const e of entries) total += e.data.length;
-  if (total > MAX_TOTAL) throw new Error('解压后总大小超过 32MB');
+  for (const e of entries) {
+    validateEntryName(e.name);
+    if (BANNED_EXT.test(e.name)) throw new Error(`安装包包含禁止的文件类型：${e.name}`);
+    if (e.uncompressedSize > MAX_TOTAL - total) throw new Error('解压后总大小超过 32MB');
+    total += e.uncompressedSize;
+    if (e.method === 0 && e.compressedSize !== e.uncompressedSize) {
+      throw new Error(`存储条目大小不匹配：${e.name}`);
+    }
+  }
   return entries;
 }
 
@@ -38,9 +43,10 @@ export function validateZipStructure(buffer) {
  * @returns {Promise<string>} 实际落地的目录名
  */
 export async function unzipToModuleDir(buffer, { root, type, preferId = '' }) {
-  const entries = validateZipStructure(buffer);
+  const descriptors = validateZipStructure(buffer);
+  const entries = inflateEntries(buffer, descriptors);
   if (!entries.length) throw new Error('安装包是空的');
-  const baseDir = path.join(root, type === 'plugin' ? 'plugins' : 'skills');
+  const baseDir = path.resolve(root, type === 'plugin' ? 'plugins' : 'skills');
 
   // 剥统一根目录：所有条目都共享同一个第一段时去掉它
   let names = entries.map((e) => e.name);
@@ -50,17 +56,35 @@ export async function unzipToModuleDir(buffer, { root, type, preferId = '' }) {
   const relNames = names.map((n) => n.slice(strip));
   if (relNames.some((n) => !n)) throw new Error('安装包结构异常（剥掉根目录后有条目为空）');
 
-  // 落地目录名：优先 zip 根目录名，其次 preferId
-  let dirName = strip ? firstSeg : (preferId || 'module');
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(dirName)) dirName = preferId || 'module';
-  // 冲突递增
-  let finalName = dirName;
-  for (let n = 1; n <= 100; n++) {
-    if (!fs.existsSync(path.join(baseDir, finalName))) break;
-    finalName = `${dirName}_${n}`;
+  // 落地目录名：优先 zip 根目录名，其次 preferId；两者都必须是单段安全标识。
+  const dirName = strip ? firstSeg : (preferId || 'module');
+  if (!MODULE_NAME_RE.test(dirName)) throw new Error(`安装包模块目录名非法：${dirName}`);
+  fs.mkdirSync(baseDir, { recursive: true });
+
+  // mkdir 的原子独占创建同时处理并发安装；冲突时换名，耗尽上限就失败，
+  // 不能用 recursive=true 复用 _100 并覆盖已安装内容。
+  let finalName = '';
+  let target = '';
+  for (let n = 0; n <= 100; n++) {
+    const candidateName = n === 0 ? dirName : `${dirName}_${n}`;
+    if (!MODULE_NAME_RE.test(candidateName)) {
+      throw new Error('安装包模块目录名过长，无法生成安全的冲突后缀');
+    }
+    const candidate = path.resolve(baseDir, candidateName);
+    const rel = path.relative(baseDir, candidate);
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+      throw new Error(`安装包模块目录越界：${candidateName}`);
+    }
+    try {
+      fs.mkdirSync(candidate);
+      finalName = candidateName;
+      target = candidate;
+      break;
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+    }
   }
-  const target = path.join(baseDir, finalName);
-  fs.mkdirSync(target, { recursive: true });
+  if (!target) throw new Error(`同名目录冲突过多，无法安装：${dirName}`);
 
   for (let i = 0; i < entries.length; i++) {
     const rel = relNames[i];
@@ -76,8 +100,10 @@ export async function unzipToModuleDir(buffer, { root, type, preferId = '' }) {
   return finalName;
 }
 
-/** 极简 zip 读取器：中央目录定位 + 解压全部文件条目。不支持的特性直接抛错。 */
-function parseZip(buffer) {
+/** 解析中央目录和本地头偏移，不解压任何条目。 */
+function parseZipDirectory(buffer) {
+  if (!Buffer.isBuffer(buffer)) throw new Error('zip 内容必须是 Buffer');
+  if (buffer.length < 22) throw new Error('不是有效的 zip 文件');
   const sig = (off) => buffer.readUInt32LE(off);
   // 定位 EOCD（22 字节，从尾部向前扫，允许有注释）
   let eocd = -1;
@@ -86,40 +112,80 @@ function parseZip(buffer) {
   }
   if (eocd < 0) throw new Error('不是有效的 zip 文件');
   const count = buffer.readUInt16LE(eocd + 10);
-  let ptr = buffer.readUInt32LE(eocd + 16);
+  if (count > MAX_FILES) throw new Error(`文件数量过多（${count} > ${MAX_FILES}）`);
+  const directorySize = buffer.readUInt32LE(eocd + 12);
+  const directoryOffset = buffer.readUInt32LE(eocd + 16);
+  const directoryEnd = directoryOffset + directorySize;
+  if (directoryOffset > eocd || directoryEnd > eocd) throw new Error('zip 中央目录范围损坏');
 
   const out = [];
+  let ptr = directoryOffset;
   for (let i = 0; i < count; i++) {
+    if (ptr + 46 > directoryEnd) throw new Error('zip 中央目录损坏');
     if (sig(ptr) !== 0x02014b50) throw new Error('zip 中央目录损坏');
     const method = buffer.readUInt16LE(ptr + 10);
     const compSize = buffer.readUInt32LE(ptr + 20);
+    const uncompressedSize = buffer.readUInt32LE(ptr + 24);
     const nameLen = buffer.readUInt16LE(ptr + 28);
     const extraLen = buffer.readUInt16LE(ptr + 30);
     const commentLen = buffer.readUInt16LE(ptr + 32);
     const localOff = buffer.readUInt32LE(ptr + 42);
+    const nextPtr = ptr + 46 + nameLen + extraLen + commentLen;
+    if (nextPtr > directoryEnd) throw new Error('zip 中央目录损坏');
     const name = buffer.toString('utf8', ptr + 46, ptr + 46 + nameLen);
+    const normalizedName = name.replace(/\\/g, '/');
 
-    // 目录条目（以 / 结尾）跳过
-    if (!name.endsWith('/')) {
-      // 本地头：定位到实际数据
-      if (sig(localOff) !== 0x04034b50) throw new Error('zip 本地头损坏');
+    validateEntryName(normalizedName);
+    if (normalizedName.endsWith('/')) {
+      if (uncompressedSize !== 0 || compSize !== 0) throw new Error(`目录条目包含数据：${name}`);
+    } else {
+      if (method !== 0 && method !== 8) throw new Error(`不支持的压缩方式（method=${method}）：${name}`);
+      if (localOff + 30 > directoryOffset || sig(localOff) !== 0x04034b50) {
+        throw new Error('zip 本地头损坏');
+      }
       const lNameLen = buffer.readUInt16LE(localOff + 26);
       const lExtraLen = buffer.readUInt16LE(localOff + 28);
       const dataStart = localOff + 30 + lNameLen + lExtraLen;
-      const raw = buffer.subarray(dataStart, dataStart + compSize);
-      let data;
-      if (method === 0) data = Buffer.from(raw);
-      else if (method === 8) data = inflateRawSync(raw);
-      else throw new Error(`不支持的压缩方式（method=${method}）：${name}`);
-      out.push({ name: name.replace(/\\/g, '/'), data });
+      const dataEnd = dataStart + compSize;
+      if (dataStart > directoryOffset || dataEnd > directoryOffset || dataEnd > buffer.length) {
+        throw new Error(`zip 条目数据范围损坏：${name}`);
+      }
+      out.push({ name: normalizedName, method, compressedSize: compSize, uncompressedSize, dataStart });
     }
-    ptr += 46 + nameLen + extraLen + commentLen;
+    ptr = nextPtr;
   }
-  // 安全规则（与后端一致）
-  for (const e of out) {
-    const parts = e.name.split('/');
-    if (e.name.startsWith('/') || parts.includes('..')) throw new Error(`安装包包含非法路径：${e.name}`);
-    if (BANNED_EXT.test(e.name)) throw new Error(`安装包包含禁止的文件类型：${e.name}`);
+  if (ptr !== directoryEnd) throw new Error('zip 中央目录长度不匹配');
+  return out;
+}
+
+function validateEntryName(name) {
+  const normalized = String(name).replace(/\\/g, '/');
+  const parts = normalized.split('/');
+  if (normalized.startsWith('/') || /^[a-z]:/i.test(normalized)
+      || normalized.includes('\0') || parts.includes('..')) {
+    throw new Error(`安装包包含非法路径：${name}`);
+  }
+  if (BANNED_EXT.test(normalized)) throw new Error(`安装包包含禁止的文件类型：${name}`);
+}
+
+function inflateEntries(buffer, descriptors) {
+  let total = 0;
+  const out = [];
+  for (const entry of descriptors) {
+    const remaining = MAX_TOTAL - total;
+    if (entry.uncompressedSize > remaining) throw new Error('解压后总大小超过 32MB');
+    const raw = buffer.subarray(entry.dataStart, entry.dataStart + entry.compressedSize);
+    let data;
+    if (entry.method === 0) {
+      data = Buffer.from(raw);
+    } else {
+      // 也约束单条输出为其声明大小，防止伪造较小中央目录尺寸的 zip 炸弹。
+      const maxOutputLength = Math.max(1, Math.min(remaining, entry.uncompressedSize));
+      data = inflateRawSync(raw, { maxOutputLength });
+    }
+    if (data.length !== entry.uncompressedSize) throw new Error(`条目解压大小与中央目录不符：${entry.name}`);
+    total += data.length;
+    out.push({ name: entry.name, data });
   }
   return out;
 }

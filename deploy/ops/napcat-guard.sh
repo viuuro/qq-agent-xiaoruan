@@ -41,9 +41,9 @@ if [ -f "$COMPOSE_DIR/.env" ]; then
   . "$COMPOSE_DIR/.env"
   set +a
 fi
-WEBUI_TOKEN="${WEBUI_TOKEN:-}"
+WEBUI_TOKEN="${WEBUI_TOKEN:-${NAPCAT_WEBUI_TOKEN:-}}"
 if [ -z "$WEBUI_TOKEN" ]; then
-  echo "napcat-guard: 未找到 WEBUI_TOKEN（请检查 $COMPOSE_DIR/.env）" >&2
+  echo "napcat-guard: 未找到 WEBUI_TOKEN（兼容 NAPCAT_WEBUI_TOKEN；请检查 $COMPOSE_DIR/.env）" >&2
 fi
 
 last_state=""
@@ -113,15 +113,16 @@ if command -v curl >/dev/null 2>&1 && [ "$container_running" = "yes" ] && [ -n "
 fi
 
 # ---- 4) 最近日志关键行 ----
+KICK_PATTERN='KickedOffLine|下线通知|登录已失效'
 logs="$(docker logs --tail 400 "$CONTAINER" 2>&1 || true)"
-last_kick="$(printf '%s\n' "$logs" | grep -E 'KickedOffLine|下线通知|登录已失效' | tail -1 | cut -c1-140)"
+last_kick="$(printf '%s\n' "$logs" | grep -E "$KICK_PATTERN" | tail -1 | cut -c1-140)"
 last_login_err="$(printf '%s\n' "$logs" | grep -E 'Login Error' | tail -1 | cut -c1-140)"
 last_sent="$(printf '%s\n' "$logs" | grep -E '发送 -> ' | tail -1 | cut -c1-120)"
 last_recv="$(printf '%s\n' "$logs" | grep -E '接收 <- ' | tail -1 | cut -c1-120)"
 
 # 在线态：只看「最后一次被踢之后」的状态变更，否则会把历史上的"变更为离线"当成当前状态
 # （v1 的坑：刚登录成功却显示"离线"，因为被踢那次的记录还在日志里）
-kick_line_no="$(printf '%s\n' "$logs" | grep -nE 'KickedOffLine|登录已失效' | tail -1 | cut -d: -f1)"
+kick_line_no="$(printf '%s\n' "$logs" | grep -nE "$KICK_PATTERN" | tail -1 | cut -d: -f1)"
 if [ -n "$kick_line_no" ]; then
   tail_after_kick="$(printf '%s\n' "$logs" | tail -n +$((kick_line_no + 1)))"
 else
@@ -136,21 +137,20 @@ fi
 [ -z "$online_state" ] && online_state="（本次会话内无状态变更记录）"
 
 # ---- 判定 ----
-state="OK"
-detail=""
+state="UNKNOWN"
+detail="无法确认账号登录状态"
 if [ "$container_running" != "yes" ]; then
   state="DOWN"; detail="容器未运行"
 elif [ "$port_ok" != "yes" ]; then
   state="DOWN"; detail="宿主机 ${WS_PORT} 未监听（NapCat 可能正在重启）"
 elif [ "$login_state" = "not_logged_in" ]; then
   state="KICKED"; detail="账号未登录${login_detail:+（$login_detail）}，需要扫码"
-elif [ "$login_state" = "unknown" ] && [ -n "$last_kick" ]; then
-  # 问不到登录状态时的兜底：被踢过且之后没有登录成功记录
-  kick_line="$(printf '%s\n' "$logs" | grep -nE 'KickedOffLine|登录已失效' | tail -1 | cut -d: -f1)"
-  ready_line="$(printf '%s\n' "$logs" | grep -nE '登录成功' | tail -1 | cut -d: -f1)"
-  if [ -z "$ready_line" ] || [ "${ready_line:-0}" -lt "${kick_line:-0}" ]; then
-    state="KICKED"; detail="日志显示被踢下线，需重新扫码"
-  fi
+elif [ "$login_state" = "logged_in" ]; then
+  state="OK"; detail=""
+else
+  state="UNKNOWN"
+  detail="WebUI 未能确认账号登录状态${login_detail:+（$login_detail）}"
+  [ -z "$last_kick" ] || detail="$detail；最近日志存在下线通知，需复查"
 fi
 
 now="$(date '+%Y-%m-%d %H:%M:%S')"
@@ -177,6 +177,7 @@ now="$(date '+%Y-%m-%d %H:%M:%S')"
   echo "状态含义:"
   echo "  OK     = 容器在跑、端口在听、账号已登录"
   echo "  KICKED = 账号被腾讯踢下线，NapCat 停在二维码页，需要人工扫码"
+  echo "  UNKNOWN= WebUI 未确认登录状态，不能视为正常"
   echo "  DOWN   = 容器或端口异常（NapCat 通常会自动重启，稍等再看）"
   echo "重新扫码: 先开 SSH 隧道，再访问"
   echo "          http://127.0.0.1:6099/webui  （token 见 $COMPOSE_DIR/.env 的 WEBUI_TOKEN）"
@@ -191,6 +192,9 @@ if [ "$state" != "$last_state" ]; then
   elif [ "$state" = "DOWN" ]; then
     logger -t napcat-guard -p daemon.err "[NAPWARN] NapCat 异常：$detail ($now)"
     echo "[NAPWARN] $now NapCat 异常 —— $detail" >&2
+  elif [ "$state" = "UNKNOWN" ]; then
+    logger -t napcat-guard -p daemon.warning "[NAPWARN] NapCat 登录状态未知：$detail ($now)"
+    echo "[NAPWARN] $now NapCat 登录状态未知 —— $detail" >&2
   elif [ "$state" = "OK" ] && [ -n "$last_state" ]; then
     logger -t napcat-guard -p daemon.info "[napcat-guard] 已恢复正常 ($now)"
     echo "[napcat-guard] $now 已恢复正常" >&2

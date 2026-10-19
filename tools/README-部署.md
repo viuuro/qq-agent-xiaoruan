@@ -1,97 +1,78 @@
-# 部署说明（协作者）
+# 部署说明（Linux 协作者）
 
-服务器：`<服务器IP>`　端口 `22`
-登录：`ssh -i ~/.ssh/id_ed25519 dev@<服务器IP>`（首次会问 host key，输 `yes`；不需要密码）
+管理员为你配置独立账户及 SSH 公钥。示例账户为 `dev`：
 
-> 你的账号是 `dev`（普通用户）。`ZHEhao423` 只是 SSH 密钥的备注名，不是登录用户名。
-> 你**没有完整 sudo**，只能执行下面的 `qqdeploy`。
+```bash
+ssh -i ~/.ssh/id_ed25519 dev@<服务器IP>
+```
 
-## 部署一个分支
+首次连接先向管理员核对 host key 指纹。不要共享 root 密码，也不要直接使用 Docker socket；此前已有 Docker 组权限的账户需由管理员单独审计。
 
-    sudo qqdeploy <分支名>        # 例如 sudo qqdeploy feat/my-change
-    sudo qqdeploy <commit-sha>
+## 日常部署
 
-脚本会：从 GitHub 下载 → 语法与依赖校验 → 无缓存重建 → 健康检查
-（容器在跑 / OneBot 已连 / 插件未丢）。**任一不过会自动回滚**，不会把线上弄坏。
+```bash
+sudo qqdeploy --dry-run main
+sudo qqdeploy main
+sudo qqdeploy --status
+sudo qqdeploy --list
+```
 
-## 常用命令
+也可部署管理员允许仓库中的分支或提交 SHA。自己的 GitHub fork 分支不一定在部署源仓库中，先确认 PR 目标及管理员配置的仓库。
 
-    sudo qqdeploy --status        # 当前部署的是哪版、谁部署的、健康状态
-    sudo qqdeploy --list          # 部署历史 + 本地保留的版本
-    sudo qqdeploy --rollback      # 回滚到上一个版本
-    sudo qqdeploy --dry-run main  # 演练：只构建不切换（线上不受影响）
+部署源由管理员维护 `/etc/qqdeploy/repositories.json`，默认指向 `viuuro/qq-agent-xiaoruan`。仓库授权变化需要管理员审核，不能通过临时环境变量切换到任意仓库。
 
-## 目录结构（看懂这个就不容易踩坑）
+部署器会固定完整 SHA、校验代码、构建该版本镜像，然后切换并检查容器、OneBot 和原有启用插件。演练只准备与构建，不切换线上容器。构建与恢复期间有独占锁，看到其他人正在部署时等待，不绕过锁。
 
-    /opt/qq/                         部署根目录
-      current -> releases/<sha>/     ★ 软链，指向当前部署的版本
-      releases/<sha>/                每次部署的独立目录（保留最近 8 个）
-      qq-agent-data/                 ★ 数据：配置/存档/记忆/会话（独立挂载，重建不丢）
-      qq-agent-plugins/              ★ 插件本体（同上）
-      napcat/                        NapCat 配置与 QQ 登录态
-      .deployed.json                 部署记录
-      .env                           凭据（WEBUI_TOKEN 等），不入版本库
-      docker-compose.napcat.yml      ★ NapCat 的唯一入口（见下）
-      docker-compose.yml.legacy      ⚠️ 已退役，别看别用
-      qq-agent/                      ⚠️ 旧源码目录，已废弃，不参与部署
+## 回滚与故障
 
-**现在跑的是哪版**：`sudo qqdeploy --status`，或 `ls -l /opt/qq/current`。
+```bash
+sudo qqdeploy --rollback
+sudo qqdeploy --rollback <完整或唯一前缀SHA>
+```
 
-## 重要规则
+目标必须是仍保留的受管理 release。失败时工具尝试恢复原版本，并检查恢复是否成功；恢复失败会明确退出并保留诊断记录，不能仅凭一行“已切回”判断服务恢复。
 
-### 1. 同一时刻只有一个人部署
+`--status` 会核对部署记录与实际状态。若出现版本不一致、没有可回退基线或健康检查持续失败，应交给管理员处理；不要手改软链或清空数据目录。
 
-脚本有 `flock` 独占锁，第二个会被明确拒绝 ——
-看到"另一个部署正在进行中"就等一下，**别绕过**。
-（服务器只有 1.6G 内存，跑不了两个实例；同一个 QQ 号也只能登一处。）
+## 查看日志与重启 NapCat
 
-### 2. 不要手改 `/opt/qq/current` 或 `releases/` 里的文件
+```bash
+sudo qqdeploy --logs qq-agent
+sudo qqdeploy --logs napcat
+sudo qqdeploy --restart-napcat
+```
 
-那些是部署产物。手改脱离版本控制，下次部署即丢失。改动请走 GitHub 分支 → PR。
+入口只允许上述固定容器。NapCat 重启会断开 QQ，执行前与其他协作者协调。不要使用旧 Compose 重建机器人，也不要在共享环境执行 `down`、`--remove-orphans`。
 
-### 3. ⚠️ 旧 compose 文件已退役，别用
+账号掉线时可通过 SSH 隧道访问管理员配置的实时二维码服务：
 
-    ❌ docker compose -f /opt/qq/docker-compose.yml up -d
+```bash
+ssh -N -L 6098:127.0.0.1:6098 dev@<服务器IP>
+```
 
-这条命令会用 `/opt/qq/qq-agent`（10-13 的旧源码）覆盖线上，且**没有明显报错**。
-旧的 `docker-compose.yml` / `docker-compose.platform.yml` 已改名为 `*.legacy`，
-直接跑会报 "compose file is invalid"，这是刻意的保护。
+浏览器打开 `http://127.0.0.1:6098/`。守护状态 `UNKNOWN` 表示查询失败或证据不足，不代表账号已登录。
 
-### 4. 重启 NapCat 只用这个方式
+## 服务器目录
 
-    docker restart napcat        # 最简单，只影响 napcat
+| 路径 | 用途 |
+|---|---|
+| `/usr/local/bin/qqdeploy` | 管理员安装的可信部署入口 |
+| `/usr/local/lib/qqdeploy/` | 可信校验器、构建及 Compose 模板 |
+| `/opt/qq/releases/<sha>/` | 版本源码；不要手改 |
+| `/opt/qq/current` | 当前版本软链 |
+| `/opt/qq/.deployed.json` | 部署与操作记录 |
+| `/opt/qq/qq-agent-data/` | 已核对的应用数据挂载 |
+| `/opt/qq/qq-agent-plugins/` | 已核对的插件挂载 |
+| `/opt/qq/napcat/` | NapCat 配置及登录态，实际路径以挂载检查为准 |
+| `/opt/qq/.env` | 服务器凭据，禁止入库或截图传播 |
+| `/opt/qq/docker-compose.napcat.yml` | 管理员维护的 NapCat 入口 |
 
-    # 或走 compose（改配置后用 up -d）
-    cd /opt/qq
-    docker compose --env-file .env -f docker-compose.napcat.yml up -d
-    docker compose --env-file .env -f docker-compose.napcat.yml logs -f
+版本默认保留最近 8 个，当前和上一个版本不随普通清理删除。
 
-> ❌ **绝对不要** `docker compose -f docker-compose.napcat.yml down`
-> 它与 qq-agent 共用项目名 `qq`，`down` 会把 qq-agent 一起删掉。
+## 管理员首次接管与入口退役
 
-### 5. 数据与插件目录别手改
+退役脚本不负责数据迁移。管理员先核对容器实际挂载、网络、UID/GID 和现有部署记录；从旧 Compose 迁入时先备份，维护窗口内迁移有变化的数据，保留原目录并建立可回退基线。
 
-`/opt/qq/qq-agent-data` 与 `/opt/qq/qq-agent-plugins` 是独立挂载，重建容器不会动它们。
-但别直接编辑里面的东西 —— 先备份再说。
+确认 qqdeploy 已使用原有数据且健康后，再执行 `tools/retire-legacy-compose.sh`。未满足前置条件时脚本会拒绝；既有配置与归档应保留。已经由 qqdeploy 管理的服务器无需再次搬运数据。
 
-## 日志与排查
-
-    sudo qqdeploy --status                 # 最快的一眼（含健康检查）
-    docker logs --tail 50 qq-agent         # 机器人日志
-    docker logs --tail 50 napcat           # 协议端日志
-    cat /opt/qq/.deployed.json             # 部署记录（当前/上一个/历史）
-    cat /opt/qq/napcat-status.txt          # 掉线守护写的状态摘要
-    journalctl -t napcat-guard -n 20       # 掉线告警历史
-
-## 出了事怎么办
-
-    sudo qqdeploy --rollback               # 回到上一个版本（约 4 分钟）
-
-部署脚本对"构建失败"和"健康检查不过"都会**自动回滚**，所以正常情况下你不需要手动操作。
-`--rollback` 是给"部署成功但行为不对"这种情况用的。
-
-如果 NapCat 被踢下线（腾讯侧问题，脚本无法绕过）：
-
-    cat /opt/qq/napcat-status.txt          # 会显示 KICKED
-    # 然后开隧道扫码：http://127.0.0.1:6098/ （实时二维码页）
-    ssh -N -L 6098:127.0.0.1:6098 dev@<服务器IP>
+本文件由安装器从仓库源文件复制到协作者家目录。修改部署说明应改此源文件，再由管理员更新安装，避免维护两份独立内容。
