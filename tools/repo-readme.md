@@ -352,6 +352,41 @@ curl -s http://127.0.0.1:3210/api/skills | python3 -m json.tool | head -20
 
 导入方式：把它填好后覆盖 `deploy/data/config.json`，再重启 qq-agent。
 
+### 知识库文档（`knowledge/`）
+
+人工维护的知识库文档放 `knowledge/`，**不入 `data/`**（`data/` 在 `.gitignore` 里，
+含密钥与聊天记录）。理由：知识库内容要版本管理 —— 写错了能回滚、多人改能 diff。
+
+```
+knowledge/
+  软协管理层与部门负责人.md     ← 部长/会长/团支书名单等
+```
+
+**它是数据、不是代码**，所以 `qqdeploy` 不会把它挪进知识库（部署只换
+`releases/<sha>/`，而知识库在 `qq-agent-data/knowledge-base/`）。部署后要显式同步：
+
+```bash
+sudo qqdeploy main          # 先把 knowledge/ 带到 releases/<sha>/
+sudo sync-knowledge         # 再推到知识库并等待重建索引
+sudo sync-knowledge --status   # 看差异
+sudo sync-knowledge --dry-run  # 演练
+```
+
+生效机制：
+
+- 知识库插件支持 `.md` / `.markdown` / `.txt`，按**标题分段**建索引
+- 插件带文件监听，手工把文件丢进 `qq-agent-data/knowledge-base/` 也会自动重建索引
+- 子目录 `learned/` 是机器人**自己学的**（搜到什么就存什么），`--prune` 不会碰它
+
+写文档的经验（照着写检索命中率高）：
+
+- 开头放一段「一句话速查」，把最常被问的结论堆在一起
+- 用表格列结构化信息（人名 + 职务），检索按段落切，表格整段命中
+- 单独写一节「常见问题怎么答」，把群聊里的口语问法列进去
+  （如"会长是谁""软件部找谁"），命中率明显更高
+- 结尾加 `> 标签：...`，方便按主题召回
+- **不确定的信息不要写**。知识库会被当成事实转述给群友，写错比不写更糟
+
 ---
 
 ## 协作流程（分支 → 部署实测 → PR → 合并）
@@ -473,6 +508,8 @@ sudo bash tools/setup-deploy-access.sh    # 见文件头的说明
 | `README-部署.md` | **协作者部署说明的源文件**（服务器 `~/README-部署.md` 由它生成；服务器 IP 用占位符，避免入仓泄露） |
 | `selfcheck-qqdeploy.py` | qqdeploy 的静态自查（未导入模块、危险 API 用法） |
 | `export-config-template.py` | 把运行中的配置导出成脱敏模板（`deploy/config.example.json` 就是这么来的） |
+| `sync-knowledge.py` | 把 `knowledge/` 里的文档同步进机器人知识库（服务器上装为 `sync-knowledge`）。**部署不会自动带过去，必须显式跑一次** |
+| `probe-kb-search.mjs` | 验证知识库能否检索到指定内容（调插件真实的 buildIndex/search）。改完知识库用它确认，别只看 .index.json |
 
 ### ⚠️ 改 README 请改模板，不要改 `README.md`
 

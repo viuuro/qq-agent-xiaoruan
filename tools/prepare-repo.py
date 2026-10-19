@@ -342,6 +342,19 @@ def main():
             shutil.copy2(s, os.path.join(OUT, f))
             print("   %s  %d 字节" % (f, os.path.getsize(s)))
 
+    # ── 3b. 知识库文档（人工维护的那部分，不含 learned/ 自动学习内容）──
+    # 放 knowledge/ 而不是塞进 data/：data/ 在 .gitignore 里（含密钥与聊天记录），
+    # 而知识库文档是要版本管理的 —— 改错了能回滚、多人改能 diff。
+    # 部署/更新时用 tools/sync-knowledge.sh 推到服务器的 knowledge-base 目录。
+    print("\n=== 3b. 收集知识库文档（knowledge/）===")
+    kb_src = os.path.join(WS, "knowledge")
+    if os.path.isdir(kb_src):
+        kb_out = os.path.join(OUT, "knowledge")
+        n = copy_tree(kb_src, kb_out, skip=("__pycache__",))
+        print("   knowledge/  %d 个文件" % n)
+    else:
+        print("   （没有 knowledge/ 目录，跳过）")
+
     # ── 4. 部署配置（compose + Dockerfile） ──
     print("\n=== 4. 生成部署配置 ===")
     deploy = os.path.join(OUT, "deploy")
