@@ -6,7 +6,7 @@
 //    safe-fetch 会拒绝解析到内网的地址，而"搜索接口部署在自家内网/反代后"是
 //    合法配置。真正的远程输入（模型传进来的 query）已由 sanitizeQuery 清洗。
 import { getConfig } from './config.js';
-import { safeFetch } from './safe-fetch.js';
+import { safeFetch, describeHttpStatus } from './safe-fetch.js';
 
 /** 查询词清洗：去 CQ 码、控制字符、超长截断。 */
 export function sanitizeQuery(query) {
@@ -170,9 +170,21 @@ export async function deepSeekSearch(query) {
 /** 抓取网页正文（走 safe-fetch 的 SSRF 全防护）。
  * browseLocked：浏览锁定开启时必须传 true —— safeFetch 会逐跳校验
  * （含重定向目标）是否在白名单内。web_fetch 工具曾经漏传这个参数，
- * 锁定开启时模型照样能抓任意站点，白名单形同虚设。 */
+ * 锁定开启时模型照样能抓任意站点，白名单形同虚设。
+ *
+ * 反爬状态码（412/429/403/451）直接抛错，不把拦截页正文交给模型：
+ * 那段 HTML 几千字节，模型读了只会复述"HTTP 412"，纯烧 token。 */
 export async function webFetch(url, { browseLocked = false } = {}) {
   const result = await safeFetch(url, { browseLocked });
+  const hint = describeHttpStatus(result.statusCode);
+  if (hint) {
+    // 403 的正文有时是"需要登录/无权限"这类有信息量的提示，附一小段剥过标签的开头，
+    // 模型据此能判断是"真被拒"还是"其实有内容"。412/429 的正文是拦截页，不附。
+    const snippet = result.statusCode === 403
+      ? String(result.body || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160)
+      : '';
+    throw new Error(snippet ? `${hint}。页面开头：${snippet}` : hint);
+  }
   return result;
 }
 
