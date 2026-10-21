@@ -1,6 +1,7 @@
 // OneBot v11 客户端：WebSocket 只收事件，HTTP API 负责发送与查询。
 // （原版经 @snowluma/sdk 收事件；这里直接实现标准 OneBot v11，去掉 SDK 补丁依赖。）
 import WebSocket from 'ws';
+import fs from 'node:fs';
 import { sanitizeUserText, escapeCqText } from './util.js';
 import { skillManager } from './skills/manager.js';
 
@@ -79,6 +80,57 @@ function describeCause(error, depth = 0) {
   }
   return parts.filter((p) => p && p !== 'fetch failed').join(' ← ')
     || parts.join(' ← ') || '未知原因';
+}
+
+// ── 媒体段的本地文件内联 ──────────────────────────────────────────────────
+// 背景：协议端（NapCat / SnowLuma）经常和本进程跑在**不同容器**里，两边文件系统
+// 不共享。段里如果放的是本进程的本地路径（例如语音插件合成出的
+// /tmp/voxcpm-voice/x.mp3），对端根本读不到 —— NapCat 会把它当成 URL 去解析，
+// 报「识别URL失败, uri=/tmp/...」，最终表现为"语音合成好了但发不出去"。
+//
+// 规则：媒体段发出前，把**本地存在**的文件内联成 base64://
+//   · 已经是 http(s):// / base64:// / data: 的，原样放行
+//   · file:// 剥掉协议后按本地路径试读（顺带兼容 Windows 的 /C:/ 写法）
+//   · 读不到 / 不是文件 / 空文件 / 超过体积上限 → 原样放行，交给对端报它自己的错
+//     宁可让它失败一次，也不把请求体撑爆（base64 会放大 33%）
+const INLINE_MEDIA_MAX_BYTES = 6 * 1024 * 1024;
+const INLINE_MEDIA_TYPES = new Set(['image', 'record', 'video', 'file']);
+
+async function inlineLocalSegments(segments) {
+  const out = [];
+  for (const seg of Array.isArray(segments) ? segments : []) {
+    const file = seg?.data?.file;
+    if (!INLINE_MEDIA_TYPES.has(String(seg?.type || '')) || typeof file !== 'string' || !file) {
+      out.push(seg);
+      continue;
+    }
+    if (/^(https?:|base64:|data:)/i.test(file)) {
+      out.push(seg);
+      continue;
+    }
+    let localPath = file;
+    if (/^file:/i.test(localPath)) {
+      try {
+        localPath = decodeURIComponent(new URL(localPath).pathname);
+        // Windows 下 file:///C:/x 的 pathname 是 /C:/x，去掉前导斜杠
+        if (/^\/[A-Za-z]:[\\/]/.test(localPath)) localPath = localPath.slice(1);
+      } catch {
+        localPath = localPath.replace(/^file:\/{2,3}/i, '');
+      }
+    }
+    try {
+      const stat = await fs.promises.stat(localPath);
+      if (!stat.isFile() || stat.size === 0 || stat.size > INLINE_MEDIA_MAX_BYTES) {
+        out.push(seg);
+        continue;
+      }
+      const buf = await fs.promises.readFile(localPath);
+      out.push({ ...seg, data: { ...seg.data, file: `base64://${buf.toString('base64')}` } });
+    } catch {
+      out.push(seg);
+    }
+  }
+  return out;
 }
 
 export class OneBotClient {
@@ -318,9 +370,11 @@ export class OneBotClient {
   /** 发送消息段。返回 OneBot 响应 data（含 message_id）。 */
   async sendSegments(kind, id, segments) {
     const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
+    // 本地路径对端读不到（跨容器场景）→ 发之前统一内联成 base64，见 inlineLocalSegments
+    const message = await inlineLocalSegments(segments);
     const params = kind === 'private'
-      ? { user_id: Number(id), message: segments }
-      : { group_id: Number(id), message: segments };
+      ? { user_id: Number(id), message }
+      : { group_id: Number(id), message };
     return this.call(action, params);
   }
 
