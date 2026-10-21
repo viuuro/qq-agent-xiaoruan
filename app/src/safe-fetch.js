@@ -208,6 +208,32 @@ export function checkBrowseLock(rawUrl, state = browseLockState()) {
   return { enabled: true, host, allowed: hostAllowed(host, state) };
 }
 
+// ── 状态码翻译成"人话" ─────────────────────────────────────────────────
+//
+// 为什么要这一层：抓取失败时把状态码原样丢给模型，模型只会复述一句
+// "HTTP 412"，群友看到的也是这句，谁都不知道发生了什么。
+// 412 尤其典型 —— 它是 bilibili 这类站点对云服务器出口 IP 的风控页，
+// 正文是几千字节的拦截 HTML，对模型毫无价值；实测换 UA、加 Referer、
+// 带 buvid3 Cookie 都不改变结果（判定维度是 IP，不是请求头）。
+// 视频站点的可用替代通道见 video-link.js。
+
+/**
+ * 把 HTTP 状态码翻译成对模型有用的说明。
+ * @returns {string|null} null 表示这个状态码没有特殊含义，正常把正文交给模型即可。
+ */
+export function describeHttpStatus(statusCode) {
+  const code = Number(statusCode) || 0;
+  if (code === 412) {
+    return 'HTTP 412：目标站点触发了反爬风控（返回的是拦截页，不是真实内容），换 UA/加 Referer 都没用，这是按出口 IP 判定的';
+  }
+  if (code === 429) return 'HTTP 429：请求太频繁被限流，等一会儿再试';
+  if (code === 403) return 'HTTP 403：目标站点拒绝访问（可能需要登录，或屏蔽了服务器出口 IP）';
+  if (code === 451) return 'HTTP 451：因法律原因无法访问该地址';
+  if (code === 407) return 'HTTP 407：需要代理认证';
+  if (code >= 500) return `HTTP ${code}：目标站点或网关故障，稍后重试`;
+  return null;
+}
+
 // ── 受限请求 ────────────────────────────────────────────────────────────
 
 function sliceByCodePoints(s, max) {

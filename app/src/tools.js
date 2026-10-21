@@ -13,6 +13,7 @@ import { formatStickerList } from './stickers.js';
 import { skillManager } from './skills/manager.js';
 import { validateImageUrl, safeFetchBinary, browseLockState, checkBrowseLock } from './safe-fetch.js';
 import { webSearch, webFetch } from './web-search.js';
+import { parseVideoUrl, resolveVideoLink, describeVideo } from './video-link.js';
 import { expandForwardNodes } from './onebot.js';
 import { registerTool, listTools } from './tool-registry.js';
 import { holidayOn, upcomingHoliday } from './holidays.js';
@@ -28,10 +29,9 @@ function currentGifRoute() {
   return resolveGifRoute({ vision: cfg.api?.vision !== false, video: cfg.api?.video === true });
 }
 
-async function downloadImageAsDataUrl(url, timeoutMs = 30000) {
+async function downloadImageAsDataUrl(url, { browseLocked = false } = {}) {
   const safeUrl = await validateImageUrl(url);
-  void timeoutMs;
-  const { buffer, contentType } = await safeFetchBinary(safeUrl);
+  const { buffer, contentType } = await safeFetchBinary(safeUrl, undefined, { browseLocked });
   if (!buffer || !buffer.length) throw new Error('图片内容为空');
   return imageBufferAsDataUrl(buffer, contentType);
 }
@@ -117,6 +117,46 @@ function midHint(ctx) {
   return uniq.length
     ? `消息 id 只能用聊天记录里每条消息前的 #数字（最近可见：${uniq.join(' ')}），不要自己编`
     : '聊天记录里还没有带 #id 的消息';
+}
+
+// ── 视频链接 ────────────────────────────────────────────────────────────
+// 视频站点的网页抓不动：bilibili 对云服务器出口 IP 直接返 412（风控页），
+// 换 UA/加 Referer 都无效。所以视频链接改走 video-link 的接口组合
+// （按 BV 号反查元信息 + 分P + 关键帧雪碧图），这两条通道实测是通的。
+//
+// 返回 null = "这不是认识的视频链接"，调用方按普通网页抓取处理。
+async function videoLinkResult(url) {
+  if (!parseVideoUrl(url)) return null;
+  const locked = browseLockState().enabled;
+  let info;
+  try {
+    info = await resolveVideoLink(url, {
+      browseLocked: locked,
+      checkLock: locked ? checkBrowseLock : null
+    });
+  } catch (error) {
+    return err(`视频链接解析失败：${error?.message ?? error}`);
+  }
+  if (info.unsupported) return null;
+  if (!info.ok) {
+    // 浏览锁定是"策略拒绝"，不是"解析失败" —— 混成一句话会误导模型去换个链接重试
+    if (info.blocked) return err(info.reason);
+    return err(`视频链接解析失败：${info.reason}`);
+  }
+
+  const text = describeVideo(info);
+  // 画面只发**关键帧拼图**：一张图里是整段视频的缩略图，信息密度最高。
+  // 封面只在拿不到关键帧时补位 —— 两张都发的话，按 1080p 封面 + 1600×900 拼图
+  // 算，一次 web_fetch 就多几万 token，而这次 run 的后续每一轮都会重发它们。
+  // 容器镜像里没装 ffmpeg，压缩不会生效，更得省着点。
+  const images = [];
+  if (getConfig().api?.vision !== false) {
+    const want = [info.framesUrl || info.coverUrl].filter(Boolean);
+    for (const u of want) {
+      try { images.push(await downloadImageAsDataUrl(u, { browseLocked: locked })); } catch { /* 单张失败不影响文字结论 */ }
+    }
+  }
+  return images.length ? getImagePartsOrVideo(text, images) : ok(text);
 }
 
 // ── 图库工具辅助 ─────────────────────────────────────────────────────────
@@ -876,7 +916,7 @@ function registerAllTools() {
   registerTool({
     id: 'web_fetch',
     name: '抓取网页',
-    description: '只读抓取网页正文（≤2 万字符）。群友发来链接问"写了什么"时直接抓；配合 web_search 阅读搜索结果的详细内容。禁止访问内网/本机地址。',
+    description: '只读抓取网页正文（≤2 万字符）。群友发来链接问"写了什么"时直接抓；配合 web_search 阅读搜索结果的详细内容。视频链接（B 站 / b23.tv 短链）也直接传进来：会返回标题、UP 主、时长、播放点赞、简介、分P，并把整段视频的关键帧拼图作为图片一起给你看。禁止访问内网/本机地址。',
     category: 'web',
     icon: '📄',
     requiresSearch: true,
@@ -886,10 +926,16 @@ function registerAllTools() {
       required: ['url']
     },
     async execute(ctx, args) {
+      const url = String(args.url ?? '').trim();
       try {
+        // 视频链接先走接口组合：bilibili 网页对云服务器出口 IP 一律 412，
+        // 而搜索/分P/关键帧这些开放接口是通的，能拿到真正有用的信息。
+        const video = await videoLinkResult(url);
+        if (video) return video;
+
         // 浏览锁定开启时逐跳校验白名单（与 send_image/search_images 同一口径；
         // 曾经漏传导致锁定形同虚设）
-        const result = await webFetch(String(args.url ?? ''), { browseLocked: browseLockState().enabled });
+        const result = await webFetch(url, { browseLocked: browseLockState().enabled });
         const body = String(result.body || '');
         return ok({
           url: result.url,
